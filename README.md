@@ -1,0 +1,2 @@
+# LLMind
+LLMind CLI 
