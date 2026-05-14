@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
 try:
@@ -12,9 +12,16 @@ except Exception:
 from appdata.progress_output import ProgressOutput
 from cache.cache_mgr import CacheManager
 from appdata.data_writer import DataWriter
+from response.response_handler import format_parameterized_response
 
 
-def perform_api_request(url: str, method: str = "GET", json_payload: Optional[dict] = None) -> Tuple[int, str]:
+def perform_api_request(
+    url: str,
+    method: str = "GET",
+    json_payload: Optional[dict] = None,
+    response_params: Optional[Iterable[dict]] = None,
+    response_template: str = "openai_responses",
+) -> Tuple[int, str]:
     """Perform a simple API request using stored API key.
 
     Returns (status_code, response_text). If no requests library is available,
@@ -60,7 +67,14 @@ def perform_api_request(url: str, method: str = "GET", json_payload: Optional[di
                 r = _requests.get(url, headers=headers, timeout=10)
             else:
                 r = _requests.request(method, url, headers=headers, json=json_payload, timeout=10)
-            return r.status_code, r.text
+            body = r.text
+            if is_openai_responses:
+                body = format_parameterized_response(
+                    body,
+                    response_params=response_params,
+                    template_name=response_template,
+                )
+            return r.status_code, body
         except Exception as exc:
             return 0, f"requests-error: {exc}"
 
@@ -77,7 +91,14 @@ def perform_api_request(url: str, method: str = "GET", json_payload: Optional[di
         with _request.urlopen(req, timeout=10) as resp:
             body = resp.read()
             try:
-                return resp.getcode(), body.decode("utf-8")
+                decoded = body.decode("utf-8")
+                if is_openai_responses:
+                    decoded = format_parameterized_response(
+                        decoded,
+                        response_params=response_params,
+                        template_name=response_template,
+                    )
+                return resp.getcode(), decoded
             except Exception:
                 return resp.getcode(), str(body)
     except Exception as exc:
