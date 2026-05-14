@@ -8,3 +8,7 @@ Hooks Detection / Deployment
 Model Tuning
 Guard rails and obersvable loop 
 OS / Observable Loop
+
+
+
+!{AgentScreenshot](https://github.com/em157/LLMind/blob/main/LLMind.png?raw=true)
