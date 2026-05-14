@@ -91,7 +91,7 @@ class DataWriter:
         cleaned = Path(filename or default).name.strip()
         if not cleaned or cleaned in {".", ".."}:
             cleaned = default
-        return "".join(char if char.isalnum() or char in "._- " else "_" for char in cleaned)
+        return "".join(char if char.isalnum() or char in "._-" else "_" for char in cleaned)
 
     def write_artifact(self, artifact_id: str, filename: str, data: bytes) -> Path:
         """Write generated/downloaded response bytes under appdata artifacts."""

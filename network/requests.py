@@ -32,7 +32,7 @@ def _store_downloadable_response(
 ) -> str:
     normalized_headers = normalize_headers(headers)
     filename = writer.sanitize_filename(get_download_filename(normalized_headers))
-    artifact_id = f"artifact_{int(time.time())}_{uuid4().hex[:8]}"
+    artifact_id = f"artifact_{time.time_ns()}_{uuid4().hex[:8]}"
     path = writer.write_artifact(artifact_id, filename, body)
     content_type = normalized_headers.get("content-type", "application/octet-stream")
     mime = content_type.split(";", 1)[0].strip() or "application/octet-stream"
