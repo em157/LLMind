@@ -136,6 +136,8 @@ class NetworkDownloadTests(unittest.TestCase):
             self.assertEqual(artifact["filename"], "output.txt")
             self.assertEqual(artifact["mime"], "text/plain")
             self.assertTrue(os.path.exists(artifact["path"]))
+            records = CacheManager(writer).load_artifact_records()
+            self.assertEqual(records[-1]["id"], artifact["id"])
             with open(artifact["path"], "rb") as handle:
                 self.assertEqual(handle.read(), b"Hello world")
 
