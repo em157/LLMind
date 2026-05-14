@@ -12,6 +12,12 @@ def parameterize_json_response(
     response_params: Optional[Iterable[Dict[str, Any]]] = None,
     template_name: str = "openai_responses",
 ) -> Dict[str, Any]:
+    """Extract configured response parameters from a JSON response body.
+
+    Returns a dictionary with ``response_params`` for the extracted fields and
+    ``raw_response`` containing either the parsed JSON body or the original text
+    when the response could not be decoded as JSON.
+    """
     parsed_response = load_json_text(response_text)
     if parsed_response is None:
         return {"raw_response": response_text}

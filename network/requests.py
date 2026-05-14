@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
 try:
@@ -18,8 +18,8 @@ from response.response_handler import format_parameterized_response
 def perform_api_request(
     url: str,
     method: str = "GET",
-    json_payload: Optional[dict] = None,
-    response_params: Optional[Iterable[dict]] = None,
+    json_payload: Optional[Dict[str, Any]] = None,
+    response_params: Optional[Iterable[Dict[str, Any]]] = None,
     response_template: str = "openai_responses",
 ) -> Tuple[int, str]:
     """Perform a simple API request using stored API key.

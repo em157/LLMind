@@ -27,14 +27,14 @@ def load_json_text(response_text: str) -> Optional[Dict[str, Any]]:
     return {"value": loaded}
 
 
-def clone_response_params(response_params: Optional[Iterable[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+def get_response_params_copy(response_params: Optional[Iterable[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     source = response_params if response_params is not None else DEFAULT_RESPONSE_PARAM_TEMPLATE
     return [deepcopy(param) for param in source]
 
 
 def normalize_response_params(response_params: Optional[Iterable[Any]] = None) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
-    for item in clone_response_params(response_params):
+    for item in get_response_params_copy(response_params):
         if isinstance(item, str):
             normalized.append({"name": item, "path": item, "default": None})
             continue
@@ -55,6 +55,11 @@ def normalize_response_params(response_params: Optional[Iterable[Any]] = None) -
 
 
 def resolve_param_path(payload: Any, path: str, default: Any = None) -> Any:
+    """Resolve a dot-separated path inside dict/list payloads.
+
+    Numeric path segments are treated as list indexes, so paths like
+    ``output.0.content.0.text`` can traverse nested response structures.
+    """
     current = payload
     for segment in path.split("."):
         if isinstance(current, list):
