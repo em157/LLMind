@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from email.message import Message
 import json
-import re
 from typing import Any, Dict, Iterable, Optional
-from urllib.parse import unquote
 
 from scripts.script_mgr import get_response_param_template
 from utils.utilities import parse_json_text, normalize_response_params, resolve_param_path
 
 
-_FILENAME_RE = re.compile(r'filename="?([^";]+)"?', re.IGNORECASE)
-_FILENAME_STAR_RE = re.compile(r"filename\*=UTF-8''([^;]+)", re.IGNORECASE)
+def _content_disposition_message(headers: Optional[Dict[str, Any]]) -> Message:
+    message = Message()
+    disposition = normalize_headers(headers).get("content-disposition", "")
+    if disposition:
+        message["Content-Disposition"] = disposition
+    return message
 
 
 def normalize_headers(headers: Optional[Dict[str, Any]]) -> Dict[str, str]:
@@ -21,10 +24,9 @@ def normalize_headers(headers: Optional[Dict[str, Any]]) -> Dict[str, str]:
 
 def get_download_filename(headers: Optional[Dict[str, Any]], default: str = "artifact.bin") -> str:
     normalized = normalize_headers(headers)
-    disposition = normalized.get("content-disposition", "")
-    match = _FILENAME_STAR_RE.search(disposition) or _FILENAME_RE.search(disposition)
-    if match:
-        return unquote(match.group(1).strip()) or default
+    filename = _content_disposition_message(normalized).get_filename()
+    if filename:
+        return filename.strip() or default
     content_type = normalized.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type.startswith("text/"):
         return "artifact.txt"
@@ -32,9 +34,8 @@ def get_download_filename(headers: Optional[Dict[str, Any]], default: str = "art
 
 
 def is_downloadable_response(headers: Optional[Dict[str, Any]]) -> bool:
-    normalized = normalize_headers(headers)
-    disposition = normalized.get("content-disposition", "").lower()
-    return "attachment" in disposition or "filename=" in disposition or "filename*=" in disposition
+    message = _content_disposition_message(headers)
+    return message.get_content_disposition() == "attachment" or bool(message.get_filename())
 
 
 def build_artifact_response(

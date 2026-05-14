@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import time
 from uuid import uuid4
 from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlparse
@@ -32,7 +31,7 @@ def _store_downloadable_response(
 ) -> str:
     normalized_headers = normalize_headers(headers)
     filename = writer.sanitize_filename(get_download_filename(normalized_headers))
-    artifact_id = f"artifact_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
+    artifact_id = f"artifact_{uuid4().hex}"
     path = writer.write_artifact(artifact_id, filename, body)
     content_type = normalized_headers.get("content-type", "application/octet-stream")
     mime = content_type.split(";", 1)[0].strip() or "application/octet-stream"

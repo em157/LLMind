@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from appdata.data_writer import DataWriter
 from cache.cache_mgr import CacheManager
@@ -97,7 +98,6 @@ class ResponseHandlerTests(unittest.TestCase):
 
 class NetworkDownloadTests(unittest.TestCase):
     def test_perform_api_request_saves_downloadable_response_artifact(self) -> None:
-        original_requests = network_requests._requests
         original_appdata = os.environ.get("APPDATA")
 
         class FakeResponse:
@@ -119,12 +119,11 @@ class NetworkDownloadTests(unittest.TestCase):
             os.environ["APPDATA"] = tmpdir
             writer = DataWriter()
             CacheManager(writer).save_api_key("sk_test_key_for_downloads")
-            network_requests._requests = FakeRequests
 
             try:
-                status, body = network_requests.perform_api_request("https://example.test/file.txt")
+                with patch("network.requests._requests", FakeRequests):
+                    status, body = network_requests.perform_api_request("https://example.test/file.txt")
             finally:
-                network_requests._requests = original_requests
                 if original_appdata is None:
                     os.environ.pop("APPDATA", None)
                 else:

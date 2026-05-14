@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from hashlib import sha256
 from pathlib import Path
 from typing import Dict
 
@@ -91,7 +92,13 @@ class DataWriter:
         cleaned = Path(filename or default).name.strip()
         if not cleaned or cleaned in {".", ".."}:
             cleaned = default
-        return "".join(char if char.isalnum() or char in "._-" else "_" for char in cleaned)
+        sanitized = "".join(char if char.isalnum() or char in "._-" else "_" for char in cleaned)
+        if sanitized == cleaned:
+            return sanitized
+        digest = sha256(cleaned.encode("utf-8")).hexdigest()[:8]
+        stem = Path(sanitized).stem or "artifact"
+        suffix = Path(sanitized).suffix
+        return f"{stem}_{digest}{suffix}"
 
     def write_artifact(self, artifact_id: str, filename: str, data: bytes) -> Path:
         """Write generated/downloaded response bytes under appdata artifacts."""
