@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from email.message import Message
 import json
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from scripts.script_mgr import get_response_param_template
@@ -26,7 +27,10 @@ def get_download_filename(headers: Optional[Dict[str, Any]], default: str = "art
     normalized = normalize_headers(headers)
     filename = _content_disposition_message(normalized).get_filename()
     if filename:
-        return filename.strip() or default
+        safe_name = Path(filename.replace("\\", "/")).name.strip()
+        if safe_name and safe_name not in {".", ".."}:
+            return safe_name
+        return default
     content_type = normalized.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type.startswith("text/"):
         return "artifact.txt"

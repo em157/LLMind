@@ -95,6 +95,10 @@ class ResponseHandlerTests(unittest.TestCase):
         self.assertTrue(is_downloadable_response(headers))
         self.assertEqual(get_download_filename(headers), "analysis.txt")
 
+    def test_download_filename_strips_path_segments(self) -> None:
+        headers = {"Content-Disposition": 'attachment; filename="../nested/evil.txt"'}
+        self.assertEqual(get_download_filename(headers), "evil.txt")
+
 
 class NetworkDownloadTests(unittest.TestCase):
     def test_perform_api_request_saves_downloadable_response_artifact(self) -> None:

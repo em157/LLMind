@@ -92,12 +92,14 @@ class DataWriter:
         cleaned = Path(filename or default).name.strip()
         if not cleaned or cleaned in {".", ".."}:
             cleaned = default
-        sanitized = "".join(char if char.isalnum() or char in "._-" else "_" for char in cleaned)
+        allowed = lambda value: "".join(char if char.isalnum() or char in "._-" else "_" for char in value)
+        sanitized = allowed(cleaned)
         if sanitized == cleaned:
             return sanitized
         digest = sha256(cleaned.encode("utf-8")).hexdigest()[:8]
-        stem = Path(sanitized).stem or "artifact"
-        suffix = Path(sanitized).suffix
+        original = Path(cleaned)
+        stem = allowed(original.stem) or "artifact"
+        suffix = allowed(original.suffix)
         return f"{stem}_{digest}{suffix}"
 
     def write_artifact(self, artifact_id: str, filename: str, data: bytes) -> Path:
