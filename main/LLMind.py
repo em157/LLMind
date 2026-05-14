@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import time
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -163,6 +164,37 @@ class LLMindCLI:
 			return "*" * len(key)
 		return f"{key[:4]}...{key[-4:]}"
 
+	@staticmethod
+	def _is_openai_responses_url(url: str) -> bool:
+		parsed = urlparse(url)
+		return parsed.netloc.lower() == "api.openai.com" and parsed.path.rstrip("/") == "/v1/responses"
+
+	def _build_responses_payload_prompt(self) -> dict:
+		print("\nOpenAI /v1/responses payload")
+		model = input("Model (default gpt-4.1-mini): ").strip() or "gpt-4.1-mini"
+		prompt_text = input("Prompt/Input text: ").strip() or "Hello from LLMind"
+		instructions = input("System instructions (optional): ").strip()
+		temperature_raw = input("Temperature (optional, e.g. 0.7): ").strip()
+		max_output_tokens_raw = input("Max output tokens (optional): ").strip()
+
+		payload = {
+			"model": model,
+			"input": prompt_text,
+		}
+		if instructions:
+			payload["instructions"] = instructions
+		if temperature_raw:
+			try:
+				payload["temperature"] = float(temperature_raw)
+			except ValueError:
+				self.progress.warn("Invalid temperature value; skipping.")
+		if max_output_tokens_raw:
+			try:
+				payload["max_output_tokens"] = int(max_output_tokens_raw)
+			except ValueError:
+				self.progress.warn("Invalid max_output_tokens value; skipping.")
+		return payload
+
 	def run(self) -> int:
 		self.progress.step("Initializing appdata")
 		self.writer.ensure_appdata()
@@ -184,7 +216,11 @@ class LLMindCLI:
 			elif choice == "2":
 				# Simple example hostname to test against. The user can edit this.
 				url = input("Enter URL to request (default https://httpbin.org/get): ").strip() or "https://httpbin.org/get"
-				status, body = perform_api_request(url)
+				method = input("HTTP method (default GET): ").strip().upper() or "GET"
+				payload = None
+				if self._is_openai_responses_url(url):
+					payload = self._build_responses_payload_prompt()
+				status, body = perform_api_request(url, method=method, json_payload=payload)
 				if status == 0:
 					self.progress.error(f"Request failed: {body}")
 				else:
