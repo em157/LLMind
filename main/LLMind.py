@@ -15,11 +15,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import sys
 
-# When running the script from the `main/` directory, sibling packages (network, cache, appdata)
-# aren't on sys.path by default. Add the repository root to sys.path so imports like
-# `from network.requests import ...` work in both development and packaged runs.
+# Ensure repository root is on sys.path so local sibling packages import correctly
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from network.requests import perform_api_request
