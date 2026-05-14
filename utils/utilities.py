@@ -63,15 +63,22 @@ def normalize_response_params(response_params: Optional[Iterable[Any]] = None) -
 def resolve_param_path(payload: Any, path: str, default: Any = None) -> Any:
     """Resolve a dot-separated path inside dict/list payloads.
 
-    Numeric path segments are treated as list indexes, so paths like
-    `output.0.content.0.text` can traverse nested response structures.
+    Args:
+        payload: Parsed JSON payload to inspect.
+        path: Dot-separated lookup path such as `output.0.content.0.text`.
+        default: Value returned when any path segment cannot be resolved.
+
+    Returns:
+        The resolved value when the full path exists, otherwise `default`.
     """
     current = payload
     for segment in path.split("."):
         if isinstance(current, list):
+            if not segment.isdigit():
+                return default
             try:
                 current = current[int(segment)]
-            except (ValueError, IndexError):
+            except IndexError:
                 return default
             continue
 

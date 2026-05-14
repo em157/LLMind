@@ -14,9 +14,16 @@ def parameterize_json_response(
 ) -> Dict[str, Any]:
     """Extract configured response parameters from a JSON response body.
 
-    Returns a dictionary with `response_params` for the extracted fields and
-    `raw_response` containing either the parsed JSON body or the original text
-    when the response could not be decoded as JSON.
+    Args:
+        response_text: Raw response body returned by the LLM endpoint.
+        response_params: Optional response parameter definitions with `name`,
+            `path`, and optional `default` values.
+        template_name: Template name used when `response_params` is omitted.
+
+    Returns:
+        A dictionary with `response_params` for extracted fields and
+        `raw_response` containing either the parsed JSON body or the original
+        text when the response could not be decoded as JSON.
     """
     parsed_response = load_json_text(response_text)
     if parsed_response is None:
