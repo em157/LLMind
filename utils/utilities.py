@@ -19,7 +19,7 @@ DEFAULT_RESPONSE_PARAM_TEMPLATE: List[Dict[str, Any]] = [
 ]
 
 
-def load_json_text(response_text: str) -> Optional[Any]:
+def parse_json_text(response_text: str) -> Optional[Any]:
     try:
         loaded = json.loads(response_text)
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -32,6 +32,12 @@ def get_response_params_copy(response_params: Optional[Iterable[Dict[str, Any]]]
     return [deepcopy(param) for param in source]
 
 
+def _clean_string(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
 def normalize_response_params(response_params: Optional[Iterable[Any]] = None) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
     for item in get_response_params_copy(response_params):
@@ -39,21 +45,15 @@ def normalize_response_params(response_params: Optional[Iterable[Any]] = None) -
             normalized.append({"name": item, "path": item, "default": None})
             continue
 
-        name_value = item.get("name")
-        path = item.get("path")
-        if isinstance(name_value, str) and name_value.strip():
-            name = name_value.strip()
-        elif isinstance(path, str) and path.strip():
-            name = path.strip()
-        else:
-            name = ""
-        if not name or not isinstance(path, str) or not path.strip():
+        path = _clean_string(item.get("path"))
+        name = _clean_string(item.get("name")) or path
+        if not name or not path:
             continue
 
         normalized.append(
             {
                 "name": name,
-                "path": path.strip(),
+                "path": path,
                 "default": item.get("default"),
             }
         )

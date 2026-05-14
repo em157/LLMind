@@ -4,7 +4,7 @@ import json
 from typing import Any, Dict, Iterable, Optional
 
 from scripts.script_mgr import get_response_param_template
-from utils.utilities import load_json_text, normalize_response_params, resolve_param_path
+from utils.utilities import parse_json_text, normalize_response_params, resolve_param_path
 
 
 def parameterize_json_response(
@@ -25,7 +25,7 @@ def parameterize_json_response(
         `raw_response` containing either the parsed JSON body or the original
         text when the response could not be decoded as JSON.
     """
-    parsed_response = load_json_text(response_text)
+    parsed_response = parse_json_text(response_text)
     if parsed_response is None:
         return {"response_params": {}, "raw_response": response_text}
 
