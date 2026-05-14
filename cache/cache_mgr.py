@@ -47,6 +47,14 @@ class CacheManager:
             return None
 
     def save_artifact_record(self, artifact: Dict[str, Any]) -> Path:
+        """Save artifact metadata with a timestamp and cap retained records.
+
+        Args:
+            artifact: Artifact metadata returned to the caller.
+
+        Returns:
+            Path to the artifact cache JSON file.
+        """
         lock_path = self._acquire_artifact_cache_lock()
         try:
             payload = self.writer.read_json(ARTIFACT_CACHE_FILENAME)
@@ -64,6 +72,7 @@ class CacheManager:
                 pass
 
     def load_artifact_records(self) -> List[Dict[str, Any]]:
+        """Load artifact metadata records and ignore malformed cache entries."""
         payload = self.writer.read_json(ARTIFACT_CACHE_FILENAME)
         records = payload.get("artifacts", [])
         if not isinstance(records, list):
