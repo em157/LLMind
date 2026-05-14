@@ -20,7 +20,7 @@ def parameterize_json_response(
     """
     parsed_response = load_json_text(response_text)
     if parsed_response is None:
-        return {"raw_response": response_text}
+        return {"response_params": {}, "raw_response": response_text}
 
     active_params = normalize_response_params(response_params or get_response_param_template(template_name))
     parameterized_response: Dict[str, Any] = {}

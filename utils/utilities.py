@@ -5,6 +5,8 @@ from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Optional
 
 
+# Default mapping for OpenAI /v1/responses payloads with nested ``output`` and
+# ``usage`` sections.
 DEFAULT_RESPONSE_PARAM_TEMPLATE: List[Dict[str, Any]] = [
     {"name": "response_id", "path": "id", "default": None},
     {"name": "model", "path": "model", "default": None},
@@ -17,14 +19,12 @@ DEFAULT_RESPONSE_PARAM_TEMPLATE: List[Dict[str, Any]] = [
 ]
 
 
-def load_json_text(response_text: str) -> Optional[Dict[str, Any]]:
+def load_json_text(response_text: str) -> Optional[Any]:
     try:
         loaded = json.loads(response_text)
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
-    if isinstance(loaded, dict):
-        return loaded
-    return {"value": loaded}
+    return loaded
 
 
 def get_response_params_copy(response_params: Optional[Iterable[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
@@ -39,8 +39,14 @@ def normalize_response_params(response_params: Optional[Iterable[Any]] = None) -
             normalized.append({"name": item, "path": item, "default": None})
             continue
 
-        name = str(item.get("name") or item.get("path") or "").strip()
+        name_value = item.get("name")
         path = item.get("path")
+        if isinstance(name_value, str) and name_value.strip():
+            name = name_value.strip()
+        elif isinstance(path, str) and path.strip():
+            name = path.strip()
+        else:
+            name = ""
         if not name or not isinstance(path, str) or not path.strip():
             continue
 
