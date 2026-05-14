@@ -9,6 +9,7 @@ from appdata.data_writer import DataWriter
 
 CACHE_FILENAME = "api_cache.json"
 ARTIFACT_CACHE_FILENAME = "artifact_cache.json"
+MAX_ARTIFACT_RECORDS = 100
 
 
 class CacheManager:
@@ -52,7 +53,7 @@ class CacheManager:
         record = dict(artifact)
         record["created_at"] = int(time.time())
         records.append(record)
-        return self.writer.write_json(ARTIFACT_CACHE_FILENAME, {"artifacts": records[-100:]})
+        return self.writer.write_json(ARTIFACT_CACHE_FILENAME, {"artifacts": records[-MAX_ARTIFACT_RECORDS:]})
 
     def load_artifact_records(self) -> List[Dict[str, Any]]:
         payload = self.writer.read_json(ARTIFACT_CACHE_FILENAME)

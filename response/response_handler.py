@@ -27,7 +27,7 @@ def get_download_filename(headers: Optional[Dict[str, Any]], default: str = "art
         return unquote(match.group(1).strip()) or default
     content_type = normalized.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type.startswith("text/"):
-        return "output.txt"
+        return "artifact.txt"
     return default
 
 
