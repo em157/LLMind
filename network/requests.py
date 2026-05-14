@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import Optional, Tuple
+import time
+from typing import Any, Dict, Optional, Tuple, Union
 
 try:
     import requests as _requests
@@ -13,13 +14,30 @@ from cache.cache_mgr import CacheManager
 from appdata.data_writer import DataWriter
 
 
-def perform_api_request(url: str, method: str = "GET", json_payload: Optional[dict] = None) -> Tuple[int, str]:
-    """Perform a simple API request using stored API key.
+JsonDict = Dict[str, Any]
 
-    Returns (status_code, response_text). If no requests library is available,
-    falls back to urllib. Uses CacheManager to load the stored key and passes
-    it in an Authorization header as 'Bearer <key>'.
+
+def perform_api_request(
+    url: str,
+    method: str = "POST",
+    json_payload: Optional[JsonDict] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
+    timeout: Tuple[int, int] = (5, 60),  # connect, read
+    retries: int = 2,
+) -> Tuple[int, Union[str, JsonDict]]:
     """
+    Robust LLM API request helper.
+
+    Returns:
+        (status_code, parsed_json_or_text)
+
+    Suitable for:
+        - OpenAI /v1/responses
+        - OpenAI-compatible APIs
+        - Anthropic-style APIs if extra_headers are supplied
+        - local LLM servers
+    """
+
     progress = ProgressOutput()
     writer = DataWriter()
     cache = CacheManager(writer)
@@ -29,36 +47,67 @@ def perform_api_request(url: str, method: str = "GET", json_payload: Optional[di
         progress.warn("No API key available for request")
         return 0, "no-api-key"
 
-    headers = {"Authorization": f"Bearer {key}"}
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "WinAgentCLI/0.1",
+    }
 
-    progress.step(f"Sending {method} request to {url}")
+    if extra_headers:
+        headers.update(extra_headers)
 
-    # Prefer requests if installed
-    if _requests is not None:
+    method = method.upper()
+
+    for attempt in range(retries + 1):
         try:
-            if method.upper() == "GET":
-                r = _requests.get(url, headers=headers, timeout=10)
-            else:
-                r = _requests.request(method.upper(), url, headers=headers, json=json_payload, timeout=10)
-            return r.status_code, r.text
+            progress.step(f"Sending {method} request to {url}")
+
+            if _requests is not None:
+                r = _requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    json=json_payload if json_payload is not None else None,
+                    timeout=timeout,
+                )
+
+                try:
+                    body = r.json()
+                except ValueError:
+                    body = r.text
+
+                if r.status_code >= 400:
+                    return r.status_code, body
+
+                return r.status_code, body
+
+            # urllib fallback
+            from urllib import request as _request
+            from urllib.error import HTTPError, URLError
+
+            data = None
+            if json_payload is not None:
+                data = json.dumps(json_payload).encode("utf-8")
+
+            req = _request.Request(
+                url,
+                data=data,
+                headers=headers,
+                method=method,
+            )
+
+            with _request.urlopen(req, timeout=sum(timeout)) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                try:
+                    return resp.getcode(), json.loads(raw)
+                except json.JSONDecodeError:
+                    return resp.getcode(), raw
+
         except Exception as exc:
-            return 0, f"requests-error: {exc}"
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return 0, f"request-error: {exc}"
 
-    # Fallback to urllib
-    try:
-        from urllib import request as _request
-
-        data = None
-        if json_payload is not None:
-            data = json.dumps(json_payload).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-
-        req = _request.Request(url, data=data, headers=headers, method=method.upper())
-        with _request.urlopen(req, timeout=10) as resp:
-            body = resp.read()
-            try:
-                return resp.getcode(), body.decode("utf-8")
-            except Exception:
-                return resp.getcode(), str(body)
-    except Exception as exc:
-        return 0, f"urllib-error: {exc}"
+    return 0, "unknown-request-error"
