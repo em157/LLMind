@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from appdata.data_writer import DataWriter
 
 
 CACHE_FILENAME = "api_cache.json"
+ARTIFACT_CACHE_FILENAME = "artifact_cache.json"
 
 
 class CacheManager:
@@ -43,3 +44,20 @@ class CacheManager:
             return self.writer.write_file(dest, data)
         except Exception:
             return None
+
+    def save_artifact_record(self, artifact: Dict[str, Any]) -> Path:
+        payload = self.writer.read_json(ARTIFACT_CACHE_FILENAME)
+        records = payload.get("artifacts", [])
+        if not isinstance(records, list):
+            records = []
+        record = dict(artifact)
+        record["created_at"] = int(time.time())
+        records.append(record)
+        return self.writer.write_json(ARTIFACT_CACHE_FILENAME, {"artifacts": records[-100:]})
+
+    def load_artifact_records(self) -> List[Dict[str, Any]]:
+        payload = self.writer.read_json(ARTIFACT_CACHE_FILENAME)
+        records = payload.get("artifacts", [])
+        if not isinstance(records, list):
+            return []
+        return [record for record in records if isinstance(record, dict)]

@@ -85,3 +85,36 @@ class DataWriter:
         except Exception:
             pass
         return target
+
+    @staticmethod
+    def sanitize_filename(filename: str, default: str = "artifact.bin") -> str:
+        cleaned = Path(filename or default).name.strip()
+        if not cleaned or cleaned in {".", ".."}:
+            cleaned = default
+        return "".join(char if char.isalnum() or char in "._- " else "_" for char in cleaned)
+
+    def write_artifact(self, artifact_id: str, filename: str, data: bytes) -> Path:
+        """Write generated/downloaded response bytes under appdata artifacts."""
+        self.ensure_appdata()
+        safe_id = self.sanitize_filename(artifact_id, default="artifact")
+        safe_name = self.sanitize_filename(filename)
+        artifact_dir = self.app_data_dir / "artifacts" / safe_id
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        target = artifact_dir / safe_name
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        with tmp.open("wb") as fh:
+            fh.write(data)
+        try:
+            os.replace(str(tmp), str(target))
+        except Exception:
+            tmp.rename(target)
+        try:
+            if os.name == "posix":
+                target.chmod(0o600)
+        except Exception:
+            pass
+        return target
+
+    @staticmethod
+    def file_url(path: Path) -> str:
+        return path.resolve().as_uri()
