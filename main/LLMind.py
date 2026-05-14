@@ -24,6 +24,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from network.requests import perform_api_request
+from scripts.script_mgr import get_response_param_template
 
 
 APP_NAME = "LLMind"
@@ -218,9 +219,16 @@ class LLMindCLI:
 				url = input("Enter URL to request (default https://httpbin.org/get): ").strip() or "https://httpbin.org/get"
 				method = input("HTTP method (default GET): ").strip().upper() or "GET"
 				payload = None
+				response_params = None
 				if self._is_openai_responses_url(url):
 					payload = self._build_responses_payload_prompt()
-				status, body = perform_api_request(url, method=method, json_payload=payload)
+					response_params = get_response_param_template()
+				status, body = perform_api_request(
+					url,
+					method=method,
+					json_payload=payload,
+					response_params=response_params,
+				)
 				if status == 0:
 					self.progress.error(f"Request failed: {body}")
 				else:
