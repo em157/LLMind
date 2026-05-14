@@ -5,8 +5,8 @@ from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Optional
 
 
-# Default mapping for OpenAI /v1/responses payloads with nested ``output`` and
-# ``usage`` sections.
+# Default mapping for OpenAI /v1/responses payloads with nested `output` and
+# `usage` sections.
 DEFAULT_RESPONSE_PARAM_TEMPLATE: List[Dict[str, Any]] = [
     {"name": "response_id", "path": "id", "default": None},
     {"name": "model", "path": "model", "default": None},
@@ -64,7 +64,7 @@ def resolve_param_path(payload: Any, path: str, default: Any = None) -> Any:
     """Resolve a dot-separated path inside dict/list payloads.
 
     Numeric path segments are treated as list indexes, so paths like
-    ``output.0.content.0.text`` can traverse nested response structures.
+    `output.0.content.0.text` can traverse nested response structures.
     """
     current = payload
     for segment in path.split("."):

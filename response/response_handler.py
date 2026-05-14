@@ -14,8 +14,8 @@ def parameterize_json_response(
 ) -> Dict[str, Any]:
     """Extract configured response parameters from a JSON response body.
 
-    Returns a dictionary with ``response_params`` for the extracted fields and
-    ``raw_response`` containing either the parsed JSON body or the original text
+    Returns a dictionary with `response_params` for the extracted fields and
+    `raw_response` containing either the parsed JSON body or the original text
     when the response could not be decoded as JSON.
     """
     parsed_response = load_json_text(response_text)
