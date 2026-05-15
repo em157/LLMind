@@ -2,14 +2,35 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from utils.utilities import get_response_params_copy
+from utils.utilities import (
+    get_response_params_copy,
+    ANTHROPIC_RESPONSE_PARAM_TEMPLATE,
+    GEMINI_RESPONSE_PARAM_TEMPLATE,
+    OPENAI_CHAT_RESPONSE_PARAM_TEMPLATE,
+)
 
 
 RESPONSE_PARAM_TEMPLATES: Dict[str, Dict[str, Any]] = {
     "openai_responses": {
         "description": "Default parameter mapping for OpenAI /v1/responses JSON bodies.",
         "response_params": get_response_params_copy(),
-    }
+    },
+    "openai_chat": {
+        "description": "Parameter mapping for OpenAI /v1/chat/completions JSON bodies.",
+        "response_params": get_response_params_copy(OPENAI_CHAT_RESPONSE_PARAM_TEMPLATE),
+    },
+    "anthropic_messages": {
+        "description": "Parameter mapping for Anthropic /v1/messages JSON bodies.",
+        "response_params": get_response_params_copy(ANTHROPIC_RESPONSE_PARAM_TEMPLATE),
+    },
+    "xai_chat": {
+        "description": "Parameter mapping for xAI /v1/chat/completions JSON bodies (OpenAI-compatible).",
+        "response_params": get_response_params_copy(OPENAI_CHAT_RESPONSE_PARAM_TEMPLATE),
+    },
+    "gemini_generate": {
+        "description": "Parameter mapping for Google Gemini generateContent JSON bodies.",
+        "response_params": get_response_params_copy(GEMINI_RESPONSE_PARAM_TEMPLATE),
+    },
 }
 
 

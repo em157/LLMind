@@ -12,6 +12,15 @@ from appdata.data_writer import DataWriter
 from cache.cache_mgr import CacheManager
 from main.LLMind import LLMindCLI
 import network.requests as network_requests
+from network.providers import (
+    build_payload_from_user_input,
+    build_request_headers,
+    detect_provider,
+    get_default_payload,
+    get_response_template_name,
+    inject_api_key_into_url,
+    requires_post,
+)
 from response.response_handler import (
     extract_file_artifact_candidates,
     extract_file_artifact_candidates_from_text,
@@ -396,6 +405,378 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("Initializing appdata...", cli.progress.infos)
         self.assertTrue(any("AppData directory resolved to:" in message for message in cli.progress.infos))
+
+
+class ProviderDetectionTests(unittest.TestCase):
+    def test_detects_openai(self) -> None:
+        self.assertEqual(detect_provider("https://api.openai.com/v1/responses"), "openai")
+        self.assertEqual(detect_provider("https://api.openai.com/v1/chat/completions"), "openai")
+
+    def test_detects_anthropic(self) -> None:
+        self.assertEqual(detect_provider("https://api.anthropic.com/v1/messages"), "anthropic")
+
+    def test_detects_xai(self) -> None:
+        self.assertEqual(detect_provider("https://api.x.ai/v1/chat/completions"), "xai")
+
+    def test_detects_gemini(self) -> None:
+        self.assertEqual(
+            detect_provider(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+            ),
+            "gemini",
+        )
+
+    def test_detects_generic(self) -> None:
+        self.assertEqual(detect_provider("https://httpbin.org/get"), "generic")
+
+    def test_openai_responses_template(self) -> None:
+        self.assertEqual(
+            get_response_template_name("openai", "https://api.openai.com/v1/responses"),
+            "openai_responses",
+        )
+
+    def test_openai_chat_template(self) -> None:
+        self.assertEqual(
+            get_response_template_name("openai", "https://api.openai.com/v1/chat/completions"),
+            "openai_chat",
+        )
+
+    def test_anthropic_template(self) -> None:
+        self.assertEqual(get_response_template_name("anthropic"), "anthropic_messages")
+
+    def test_xai_template(self) -> None:
+        self.assertEqual(get_response_template_name("xai"), "xai_chat")
+
+    def test_gemini_template(self) -> None:
+        self.assertEqual(get_response_template_name("gemini"), "gemini_generate")
+
+    def test_requires_post_anthropic(self) -> None:
+        self.assertTrue(requires_post("anthropic", "https://api.anthropic.com/v1/messages"))
+
+    def test_requires_post_xai(self) -> None:
+        self.assertTrue(requires_post("xai", "https://api.x.ai/v1/chat/completions"))
+
+    def test_requires_post_gemini(self) -> None:
+        self.assertTrue(
+            requires_post(
+                "gemini",
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+            )
+        )
+
+    def test_requires_post_openai_responses(self) -> None:
+        self.assertTrue(requires_post("openai", "https://api.openai.com/v1/responses"))
+
+    def test_generic_does_not_require_post(self) -> None:
+        self.assertFalse(requires_post("generic", "https://httpbin.org/get"))
+
+
+class ProviderHeaderTests(unittest.TestCase):
+    def test_openai_uses_bearer_auth(self) -> None:
+        headers = build_request_headers("openai", "sk-test-key")
+        self.assertEqual(headers["Authorization"], "Bearer sk-test-key")
+        self.assertEqual(headers["Content-Type"], "application/json")
+
+    def test_anthropic_uses_x_api_key(self) -> None:
+        headers = build_request_headers("anthropic", "ant-test-key")
+        self.assertEqual(headers["x-api-key"], "ant-test-key")
+        self.assertIn("anthropic-version", headers)
+        self.assertNotIn("Authorization", headers)
+
+    def test_xai_uses_bearer_auth(self) -> None:
+        headers = build_request_headers("xai", "xai-test-key")
+        self.assertEqual(headers["Authorization"], "Bearer xai-test-key")
+
+    def test_gemini_has_no_auth_header(self) -> None:
+        headers = build_request_headers("gemini", "gm-test-key")
+        self.assertNotIn("Authorization", headers)
+        self.assertNotIn("x-api-key", headers)
+        self.assertEqual(headers["Content-Type"], "application/json")
+
+    def test_gemini_key_injected_into_url(self) -> None:
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        result = inject_api_key_into_url(url, "gemini", "MY_GEM_KEY")
+        self.assertIn("key=MY_GEM_KEY", result)
+
+    def test_non_gemini_url_unchanged(self) -> None:
+        url = "https://api.openai.com/v1/responses"
+        result = inject_api_key_into_url(url, "openai", "sk-key")
+        self.assertEqual(result, url)
+
+
+class ProviderPayloadTests(unittest.TestCase):
+    def test_openai_default_payload(self) -> None:
+        payload = get_default_payload("openai")
+        self.assertIn("model", payload)
+        self.assertIn("input", payload)
+
+    def test_anthropic_default_payload_has_messages(self) -> None:
+        payload = get_default_payload("anthropic")
+        self.assertIn("messages", payload)
+        self.assertIn("max_tokens", payload)
+        self.assertEqual(payload["messages"][0]["role"], "user")
+
+    def test_xai_default_payload_has_messages(self) -> None:
+        payload = get_default_payload("xai")
+        self.assertIn("messages", payload)
+
+    def test_gemini_default_payload_has_contents(self) -> None:
+        payload = get_default_payload("gemini")
+        self.assertIn("contents", payload)
+        self.assertEqual(payload["contents"][0]["parts"][0]["text"], "Hello from LLMind")
+
+    def test_build_anthropic_payload_includes_system(self) -> None:
+        payload = build_payload_from_user_input(
+            "anthropic", "claude-opus-4-5", "Hello", system_instructions="Be concise."
+        )
+        self.assertEqual(payload["system"], "Be concise.")
+        self.assertEqual(payload["messages"][0]["content"], "Hello")
+
+    def test_build_xai_payload_uses_chat_format(self) -> None:
+        payload = build_payload_from_user_input(
+            "xai", "grok-3", "Hello", system_instructions="Be helpful.", temperature=0.5
+        )
+        self.assertEqual(payload["messages"][0]["role"], "system")
+        self.assertEqual(payload["messages"][1]["role"], "user")
+        self.assertEqual(payload["temperature"], 0.5)
+
+    def test_build_openai_chat_payload(self) -> None:
+        payload = build_payload_from_user_input("openai_chat", "gpt-4o", "Hi", max_tokens=100)
+        self.assertEqual(payload["messages"][0]["role"], "user")
+        self.assertEqual(payload["max_tokens"], 100)
+
+    def test_build_gemini_payload_with_generation_config(self) -> None:
+        payload = build_payload_from_user_input(
+            "gemini", "gemini-2.0-flash", "Hello", temperature=0.7, max_tokens=256
+        )
+        self.assertEqual(payload["generationConfig"]["temperature"], 0.7)
+        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 256)
+
+    def test_build_openai_responses_payload(self) -> None:
+        payload = build_payload_from_user_input(
+            "openai", "gpt-4.1-mini", "Hello", system_instructions="You are helpful.", max_tokens=512
+        )
+        self.assertEqual(payload["input"], "Hello")
+        self.assertEqual(payload["instructions"], "You are helpful.")
+        self.assertEqual(payload["max_output_tokens"], 512)
+
+
+class AnthropicRequestTests(unittest.TestCase):
+    """Mock-based tests for Anthropic /v1/messages requests."""
+
+    _ANTHROPIC_RESPONSE = {
+        "id": "msg_abc123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-5",
+        "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": "Hello from Claude!"}],
+        "usage": {"input_tokens": 10, "output_tokens": 6},
+    }
+
+    def _run_request(self, tmpdir: str) -> tuple:
+        os.environ["APPDATA"] = tmpdir
+        writer = DataWriter()
+        CacheManager(writer).save_api_key("ant-test-key-for-anthropic")
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"Content-Type": "application/json"}
+            content = json.dumps(self._ANTHROPIC_RESPONSE).encode("utf-8")
+            text = json.dumps(self._ANTHROPIC_RESPONSE)
+
+        class FakeRequests:
+            @staticmethod
+            def request(*_args, **_kwargs):
+                return FakeResponse()
+
+        with patch("network.requests._requests", FakeRequests):
+            return network_requests.perform_api_request(
+                "https://api.anthropic.com/v1/messages",
+                method="POST",
+                json_payload={
+                    "model": "claude-opus-4-5",
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+
+    def test_anthropic_response_extracts_message_text(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                status, body = self._run_request(tmpdir)
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["response_params"]["message_text"], "Hello from Claude!")
+        self.assertEqual(payload["response_params"]["stop_reason"], "end_turn")
+        self.assertEqual(payload["response_params"]["input_tokens"], 10)
+
+
+class XAIRequestTests(unittest.TestCase):
+    """Mock-based tests for xAI /v1/chat/completions requests."""
+
+    _XAI_RESPONSE = {
+        "id": "chatcmpl-xai-123",
+        "object": "chat.completion",
+        "model": "grok-3",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello from Grok!"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9},
+    }
+
+    def _run_request(self, tmpdir: str) -> tuple:
+        os.environ["APPDATA"] = tmpdir
+        writer = DataWriter()
+        CacheManager(writer).save_api_key("xai-test-key-for-grok")
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"Content-Type": "application/json"}
+            content = json.dumps(self._XAI_RESPONSE).encode("utf-8")
+            text = json.dumps(self._XAI_RESPONSE)
+
+        class FakeRequests:
+            @staticmethod
+            def request(*_args, **_kwargs):
+                return FakeResponse()
+
+        with patch("network.requests._requests", FakeRequests):
+            return network_requests.perform_api_request(
+                "https://api.x.ai/v1/chat/completions",
+                method="POST",
+                json_payload={
+                    "model": "grok-3",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+
+    def test_xai_response_extracts_message_text(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                status, body = self._run_request(tmpdir)
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["response_params"]["message_text"], "Hello from Grok!")
+        self.assertEqual(payload["response_params"]["finish_reason"], "stop")
+        self.assertEqual(payload["response_params"]["total_tokens"], 9)
+
+
+class GeminiRequestTests(unittest.TestCase):
+    """Mock-based tests for Google Gemini generateContent requests."""
+
+    _GEMINI_RESPONSE = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [{"text": "Hello from Gemini!"}],
+                    "role": "model",
+                },
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {
+            "promptTokenCount": 3,
+            "candidatesTokenCount": 4,
+            "totalTokenCount": 7,
+        },
+    }
+
+    def _run_request(self, tmpdir: str) -> tuple:
+        os.environ["APPDATA"] = tmpdir
+        writer = DataWriter()
+        CacheManager(writer).save_api_key("gm-test-key-for-gemini")
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"Content-Type": "application/json"}
+            content = json.dumps(self._GEMINI_RESPONSE).encode("utf-8")
+            text = json.dumps(self._GEMINI_RESPONSE)
+
+        class FakeRequests:
+            @staticmethod
+            def request(*_args, **_kwargs):
+                return FakeResponse()
+
+        with patch("network.requests._requests", FakeRequests):
+            return network_requests.perform_api_request(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+                method="POST",
+                json_payload={"contents": [{"parts": [{"text": "Hello"}]}]},
+            )
+
+    def test_gemini_response_extracts_message_text(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                status, body = self._run_request(tmpdir)
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["response_params"]["message_text"], "Hello from Gemini!")
+        self.assertEqual(payload["response_params"]["finish_reason"], "STOP")
+        self.assertEqual(payload["response_params"]["total_tokens"], 7)
+
+    def test_gemini_key_injected_before_request(self) -> None:
+        """Verify the Gemini API key is appended to the URL as ?key=."""
+        original_appdata = os.environ.get("APPDATA")
+        captured_urls = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            writer = DataWriter()
+            CacheManager(writer).save_api_key("gm-test-key-url-inject")
+
+            class FakeResponse:
+                status_code = 200
+                headers = {"Content-Type": "application/json"}
+                content = json.dumps(self._GEMINI_RESPONSE).encode("utf-8")
+                text = json.dumps(self._GEMINI_RESPONSE)
+
+            class FakeRequests:
+                @staticmethod
+                def request(method, url, **_kwargs):
+                    captured_urls.append(url)
+                    return FakeResponse()
+
+            try:
+                with patch("network.requests._requests", FakeRequests):
+                    network_requests.perform_api_request(
+                        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+                        method="POST",
+                        json_payload={"contents": [{"parts": [{"text": "Hi"}]}]},
+                    )
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        self.assertEqual(len(captured_urls), 1)
+        self.assertIn("key=gm-test-key-url-inject", captured_urls[0])
 
 
 if __name__ == "__main__":

@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import List, Optional
-from urllib.parse import urlparse
 from uuid import uuid4
 
 # When running the script from the `main/` directory, sibling packages (network, cache, appdata)
@@ -25,7 +24,12 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from network.requests import perform_api_request
-from scripts.script_mgr import get_response_param_template
+from network.providers import (
+    DEFAULT_MODELS,
+    build_payload_from_user_input,
+    detect_provider,
+    get_response_template_name,
+)
 from response.response_handler import extract_file_artifact_candidates
 
 
@@ -215,35 +219,47 @@ class LLMindCLI:
 		return f"{key[:4]}...{key[-4:]}"
 
 	@staticmethod
-	def _is_openai_responses_url(url: str) -> bool:
-		parsed = urlparse(url)
-		return parsed.netloc.lower() == "api.openai.com" and parsed.path.rstrip("/") == "/v1/responses"
+	def _is_llm_provider_url(url: str) -> bool:
+		"""Return True for any recognised LLM provider URL."""
+		return detect_provider(url) != "generic"
 
-	def _build_responses_payload_prompt(self) -> dict:
-		print("\nOpenAI /v1/responses payload")
-		model = input("Model (default gpt-4.1-mini): ").strip() or "gpt-4.1-mini"
+	def _build_provider_payload_prompt(self, url: str) -> dict:
+		"""Interactively build a provider-appropriate JSON request payload."""
+		provider = detect_provider(url)
+		template_name = get_response_template_name(provider, url)
+		# For OpenAI /v1/chat/completions, use the chat completions payload format.
+		payload_provider = "openai_chat" if template_name == "openai_chat" else provider
+
+		default_model = DEFAULT_MODELS.get(provider, "gpt-4.1-mini")
+		print(f"\n{provider.upper()} API payload builder")
+		model = input(f"Model (default {default_model}): ").strip() or default_model
 		prompt_text = input("Prompt/Input text: ").strip() or "Hello from LLMind"
 		instructions = input("System instructions (optional): ").strip()
 		temperature_raw = input("Temperature (optional, e.g. 0.7): ").strip()
-		max_output_tokens_raw = input("Max output tokens (optional): ").strip()
+		max_tokens_raw = input("Max tokens (optional): ").strip()
 
-		payload = {
-			"model": model,
-			"input": prompt_text,
-		}
-		if instructions:
-			payload["instructions"] = instructions
+		temperature = None
 		if temperature_raw:
 			try:
-				payload["temperature"] = float(temperature_raw)
+				temperature = float(temperature_raw)
 			except ValueError:
 				self.progress.warn("Invalid temperature value; skipping.")
-		if max_output_tokens_raw:
+
+		max_tokens = None
+		if max_tokens_raw:
 			try:
-				payload["max_output_tokens"] = int(max_output_tokens_raw)
+				max_tokens = int(max_tokens_raw)
 			except ValueError:
-				self.progress.warn("Invalid max_output_tokens value; skipping.")
-		return payload
+				self.progress.warn("Invalid max_tokens value; skipping.")
+
+		return build_payload_from_user_input(
+			provider=payload_provider,
+			model=model,
+			prompt_text=prompt_text,
+			system_instructions=instructions or None,
+			temperature=temperature,
+			max_tokens=max_tokens,
+		)
 
 	def run(self) -> int:
 		self.progress.info("Initializing appdata...")
@@ -272,15 +288,12 @@ class LLMindCLI:
 				url = input("Enter URL to request (default https://httpbin.org/get): ").strip() or "https://httpbin.org/get"
 				method = input("HTTP method (default GET): ").strip().upper() or "GET"
 				payload = None
-				response_params = None
-				if self._is_openai_responses_url(url):
-					payload = self._build_responses_payload_prompt()
-					response_params = get_response_param_template()
+				if self._is_llm_provider_url(url):
+					payload = self._build_provider_payload_prompt(url)
 				status, body = perform_api_request(
 					url,
 					method=method,
 					json_payload=payload,
-					response_params=response_params,
 				)
 				if status == 0:
 					self.progress.error(f"Request failed: {body}")
