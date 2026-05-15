@@ -125,6 +125,8 @@ def _next_code_block_after(text: str, start: int) -> Optional[str]:
 
 
 def _safe_filename(raw: str, default: str = "artifact.txt") -> str:
+    # Normalize Windows-style backslash separators so Path().name strips any
+    # leading directory portion regardless of the host platform.
     name = Path((raw or "").replace("\\", "/")).name.strip()
     if name and name not in {".", ".."}:
         return name
