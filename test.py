@@ -160,7 +160,7 @@ class NetworkDownloadTests(unittest.TestCase):
         original_appdata = os.environ.get("APPDATA")
         response_body = {
             "id": "resp_123",
-            "model": "gpt-4.1-mini-2025-04-14",
+            "model": "gpt-4.1-mini",
             "status": "completed",
             "output": [
                 {
