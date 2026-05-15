@@ -144,14 +144,13 @@ def perform_api_request(
 
     provider = detect_provider(url)
 
-    # Override method when the endpoint unconditionally requires POST.
-    if requires_post(provider, url) and method.upper() == "GET":
+    # Normalise method once and override to POST when the endpoint requires it.
+    method = method.upper()
+    if requires_post(provider, url) and method == "GET":
         progress.warn(
             f"{provider.upper()} endpoint requires POST; overriding GET to POST"
         )
         method = "POST"
-    else:
-        method = method.upper()
 
     headers = build_request_headers(provider, key)
 

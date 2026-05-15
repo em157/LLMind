@@ -28,14 +28,15 @@ def detect_provider(url: str) -> str:
     Returns one of ``"openai"``, ``"anthropic"``, ``"xai"``, ``"gemini"``,
     or ``"generic"`` when the domain is not recognised.
     """
-    host = urlparse(url).netloc.lower()
-    if "openai.com" in host:
+    # Strip port number before matching to avoid false negatives.
+    host = urlparse(url).netloc.lower().split(":")[0]
+    if host == "api.openai.com" or host.endswith(".openai.com"):
         return "openai"
-    if "anthropic.com" in host:
+    if host == "api.anthropic.com" or host.endswith(".anthropic.com"):
         return "anthropic"
-    if "x.ai" in host:
+    if host == "api.x.ai" or host.endswith(".x.ai"):
         return "xai"
-    if "googleapis.com" in host:
+    if host == "generativelanguage.googleapis.com" or host.endswith(".googleapis.com"):
         return "gemini"
     return "generic"
 
@@ -73,7 +74,7 @@ def inject_api_key_into_url(url: str, provider: str, api_key: str) -> str:
     parsed = urlparse(url)
     qs = parse_qs(parsed.query, keep_blank_values=True)
     qs["key"] = [api_key]
-    new_query = urlencode({k: v[0] for k, v in qs.items()})
+    new_query = urlencode({k: v[0] for k, v in qs.items() if len(v) > 0})
     return urlunparse(parsed._replace(query=new_query))
 
 
@@ -108,25 +109,25 @@ def requires_post(provider: str, url: str) -> bool:
     return False
 
 
-def get_default_payload(provider: str, prompt: str = "Hello from LLMind") -> Dict[str, Any]:
+def get_default_payload(provider: str, prompt_text: str = "Hello from LLMind") -> Dict[str, Any]:
     """Return a minimal default JSON payload for *provider*."""
     if provider == "anthropic":
         return {
             "model": DEFAULT_MODELS["anthropic"],
             "max_tokens": 1024,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": prompt_text}],
         }
     if provider == "xai":
         return {
             "model": DEFAULT_MODELS["xai"],
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": prompt_text}],
         }
     if provider == "gemini":
-        return {"contents": [{"parts": [{"text": prompt}]}]}
+        return {"contents": [{"parts": [{"text": prompt_text}]}]}
     # openai (responses endpoint)
     return {
         "model": DEFAULT_MODELS["openai"],
-        "input": prompt,
+        "input": prompt_text,
     }
 
 
