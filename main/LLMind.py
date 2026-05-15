@@ -73,6 +73,7 @@ class DataWriter:
 	def __init__(self, app_name: str = APP_NAME) -> None:
 		self.app_name = app_name
 		self.app_data_dir = self._resolve_appdata_dir()
+		self.progress = ProgressOutput()
 
 	def _resolve_appdata_dir(self) -> Path:
 		# Windows-first behavior; sensible fallback keeps this runnable on Linux/macOS.
@@ -120,17 +121,22 @@ class DataWriter:
 
 	def write_artifact(self, artifact_id: str, filename: str, data: bytes) -> Path:
 		self.ensure_appdata()
+		self.progress.info("Resolving appdata directory for artifact storage...")
 		safe_id = self.sanitize_filename(artifact_id, default="artifact")
 		safe_name = self.sanitize_filename(filename)
 		artifact_dir = self.app_data_dir / ARTIFACTS_DIRNAME / safe_id
+		self.progress.info(f"Creating artifact directory: {artifact_dir}")
 		artifact_dir.mkdir(parents=True, exist_ok=True)
 		target = artifact_dir / safe_name
 		tmp = target.with_suffix(target.suffix + ".tmp")
+		self.progress.info(f"Writing artifact file to temporary path: {tmp}")
 		with tmp.open("wb") as handle:
 			handle.write(data)
 		try:
 			os.replace(str(tmp), str(target))
+			self.progress.ok(f"Artifact file moved to final destination: {target}")
 		except OSError as exc:
+			self.progress.error(f"Failed to move artifact to {target}. Error: {exc}")
 			try:
 				tmp.rename(target)
 			except OSError:
@@ -238,8 +244,12 @@ class LLMindCLI:
 		return payload
 
 	def run(self) -> int:
-		self.progress.step("Initializing appdata")
+		self.progress.info("Initializing appdata...")
 		self.writer.ensure_appdata()
+		if not self.writer.app_data_dir.exists():
+			self.progress.error("Appdata directory does not exist!")
+			return 1
+		self.progress.info(f"AppData directory resolved to: {self.writer.app_data_dir}")
 		self._ensure_default_settings()
 		self.show_banner()
 
@@ -375,6 +385,7 @@ class LLMindCLI:
 		self.progress.warn("No API cache file to clear.")
 
 	def _store_response_artifacts(self, body: str) -> List[Path]:
+		self.progress.info("Searching for artifacts in the response...")
 		try:
 			payload = json.loads(body)
 		except (TypeError, ValueError, json.JSONDecodeError):
@@ -382,12 +393,27 @@ class LLMindCLI:
 
 		saved_paths: List[Path] = []
 		for candidate in extract_file_artifact_candidates(payload):
+			self.progress.info("Found artifact candidate.")
 			content = candidate.get("content")
 			if content is None or not isinstance(content, bytes) or not content:
+				self.progress.warn(f"Artifact content is empty or invalid. Skipping artifact: {candidate}")
 				continue
 			filename = candidate.get("filename", "artifact.bin")
 			artifact_id = uuid4().hex
-			saved_paths.append(self.writer.write_artifact(artifact_id, filename, content))
+			self.progress.info(
+				f"Downloading and caching artifact with ID: {artifact_id}, Filename: {filename}"
+			)
+			try:
+				saved_path = self.writer.write_artifact(artifact_id, filename, content)
+				saved_paths.append(saved_path)
+				self.progress.ok(f"Artifact saved to: {saved_path}")
+			except Exception as exc:
+				self.progress.error(f"Error saving artifact {filename}. Exception: {exc}")
+				continue
+		if not saved_paths:
+			self.progress.warn("No artifacts were downloaded or saved.")
+		else:
+			self.progress.ok(f"Total artifacts downloaded and saved: {len(saved_paths)}")
 		return saved_paths
 
 	@staticmethod

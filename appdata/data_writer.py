@@ -6,6 +6,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Dict
 
+from appdata.progress_output import ProgressOutput
+
 
 class DataWriter:
     """Small helper to read/write JSON and raw files into an app-specific
@@ -19,6 +21,7 @@ class DataWriter:
     def __init__(self, app_name: str = "LLMind") -> None:
         self.app_name = app_name
         self.app_data_dir = self._resolve_appdata_dir()
+        self.progress = ProgressOutput()
 
     def _resolve_appdata_dir(self) -> Path:
         # Follow environment conventions: APPDATA on Windows, otherwise ~/.config
@@ -108,17 +111,22 @@ class DataWriter:
     def write_artifact(self, artifact_id: str, filename: str, data: bytes) -> Path:
         """Write generated/downloaded response bytes under appdata artifacts."""
         self.ensure_appdata()
+        self.progress.info("Resolving appdata directory for artifact storage...")
         safe_id = self.sanitize_filename(artifact_id, default="artifact")
         safe_name = self.sanitize_filename(filename)
         artifact_dir = self.app_data_dir / "artifacts" / safe_id
+        self.progress.info(f"Creating artifact directory: {artifact_dir}")
         artifact_dir.mkdir(parents=True, exist_ok=True)
         target = artifact_dir / safe_name
         tmp = target.with_suffix(target.suffix + ".tmp")
+        self.progress.info(f"Writing artifact file to temporary path: {tmp}")
         with tmp.open("wb") as fh:
             fh.write(data)
         try:
             os.replace(str(tmp), str(target))
-        except Exception:
+            self.progress.ok(f"Artifact file moved to final destination: {target}")
+        except OSError as exc:
+            self.progress.error(f"Failed to move artifact to {target}. Error: {exc}")
             tmp.rename(target)
         try:
             if os.name == "posix":
