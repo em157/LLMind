@@ -14,6 +14,19 @@ from utils.utilities import parse_json_text, normalize_response_params, resolve_
 
 MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 FENCED_CODE_PATTERN = re.compile(r"```(?:[^\n`]*)\n?(.*?)```", re.DOTALL)
+# Header-style artifact reference: a filename in backticks (with an extension)
+# optionally preceded by an introductory verb such as "Created"/"Saved"/"Wrote"/
+# "Generated"/"Here is"/"File:" and optionally followed by a colon, then a
+# fenced code block whose body is the file's content.
+# Example match target:
+#     Created `positive_sentiment.txt`:
+#
+#     ```txt
+#     ...content...
+#     ```
+HEADER_FILENAME_PATTERN = re.compile(
+    r"`([^`\n/\\]+\.[A-Za-z0-9]{1,10})`\s*:?\s*(?=\n+\s*```)",
+)
 
 
 def _content_disposition_message(headers: Optional[Dict[str, Any]]) -> Message:
@@ -104,6 +117,20 @@ def _latest_code_block_before(text: str, end: int) -> Optional[str]:
     return code_blocks[-1].strip("\n")
 
 
+def _next_code_block_after(text: str, start: int) -> Optional[str]:
+    match = FENCED_CODE_PATTERN.search(text, start)
+    if match is None:
+        return None
+    return match.group(1).strip("\n")
+
+
+def _safe_filename(raw: str, default: str = "artifact.txt") -> str:
+    name = Path((raw or "").replace("\\", "/")).name.strip()
+    if name and name not in {".", ".."}:
+        return name
+    return default
+
+
 def _candidate_from_data_uri(label: str, link: str) -> Optional[Dict[str, Any]]:
     if not link.startswith("data:"):
         return None
@@ -156,6 +183,30 @@ def extract_file_artifact_candidates_from_text(text: str) -> Iterable[Dict[str, 
                 "mime": _mime_from_filename(filename),
                 "content": content.encode("utf-8"),
                 "source_url": link,
+            }
+        )
+
+    # Header-style references: "Created `foo.txt`:" followed by a fenced code
+    # block. The code block immediately following the header becomes the file
+    # content. These have no source URL.
+    for match in HEADER_FILENAME_PATTERN.finditer(text):
+        filename = _safe_filename(match.group(1).strip())
+        block = _next_code_block_after(text, match.end())
+        if block is None:
+            continue
+        encoded = block.encode("utf-8")
+        if any(
+            existing.get("filename") == filename
+            and existing.get("content") == encoded
+            for existing in candidates
+        ):
+            continue
+        candidates.append(
+            {
+                "filename": filename,
+                "mime": _mime_from_filename(filename),
+                "content": encoded,
+                "source_url": None,
             }
         )
 
