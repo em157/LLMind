@@ -12,6 +12,7 @@ from appdata.data_writer import DataWriter
 from cache.cache_mgr import CacheManager
 import network.requests as network_requests
 from response.response_handler import (
+    extract_file_artifact_candidates,
     extract_file_artifact_candidates_from_text,
     format_parameterized_response,
     get_download_filename,
@@ -110,6 +111,78 @@ class ResponseHandlerTests(unittest.TestCase):
         self.assertEqual(candidates[0]["filename"], "Ai_for_humanity.txt")
         self.assertEqual(candidates[0]["mime"], "text/plain")
         self.assertEqual(candidates[0]["content"], b"Ai for humanity")
+
+    def test_extract_file_artifact_candidate_from_header_reference(self) -> None:
+        # Mirrors the exact response shape from the problem statement: a
+        # header line introducing a backticked filename, then a fenced code
+        # block carrying the file content.
+        text = (
+            "Created `positive_sentiment.txt`:\n\n"
+            "```txt\n"
+            "Today brings bright opportunities, calm confidence, kind moments, "
+            "steady progress, grateful thoughts, renewed energy, meaningful "
+            "smiles, and hopeful beginnings ahead.\n"
+            "```"
+        )
+        candidates = list(extract_file_artifact_candidates_from_text(text))
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["filename"], "positive_sentiment.txt")
+        self.assertEqual(candidates[0]["mime"], "text/plain")
+        self.assertIsNone(candidates[0]["source_url"])
+        self.assertIn(b"bright opportunities", candidates[0]["content"])
+        self.assertTrue(candidates[0]["content"].endswith(b"hopeful beginnings ahead."))
+
+    def test_extract_file_artifact_candidates_visitor_includes_header_artifact(self) -> None:
+        # Verify "include" detection through the dict/list visitor used by the
+        # network layer when formatting OpenAI responses.
+        payload = {
+            "response_params": {
+                "message_text": (
+                    "Created `positive_sentiment.txt`:\n\n"
+                    "```txt\nToday brings bright opportunities.\n```"
+                )
+            },
+            "raw_response": {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": (
+                                    "Created `positive_sentiment.txt`:\n\n"
+                                    "```txt\nToday brings bright opportunities.\n```"
+                                ),
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+        candidates = list(extract_file_artifact_candidates(payload))
+        # Same filename + content appears in two places: deduped to a single
+        # artifact by the visitor's seen-key tracking.
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["filename"], "positive_sentiment.txt")
+        self.assertEqual(candidates[0]["content"], b"Today brings bright opportunities.")
+
+    def test_extract_file_artifact_candidates_header_preserves_multiline_body(self) -> None:
+        text = (
+            "Saved `notes.md`:\n\n"
+            "```markdown\n"
+            "# Title\n\n"
+            "- one\n"
+            "- two\n"
+            "```\n"
+        )
+        candidates = list(extract_file_artifact_candidates_from_text(text))
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["filename"], "notes.md")
+        self.assertEqual(candidates[0]["mime"], "text/markdown")
+        self.assertEqual(
+            candidates[0]["content"],
+            b"# Title\n\n- one\n- two",
+        )
 
 
 class NetworkDownloadTests(unittest.TestCase):
