@@ -399,9 +399,9 @@ class LLMindCLI:
 			self.progress.info("Found artifact candidate.")
 			content = candidate.get("content")
 			if content is None or not isinstance(content, bytes) or not content:
-				invalid_filename = candidate.get("filename", "artifact.bin")
+				candidate_filename = candidate.get("filename", "artifact.bin")
 				self.progress.warn(
-					f"Artifact content is empty or invalid. Skipping artifact: {invalid_filename}"
+					f"Artifact content is empty or invalid. Skipping artifact: {candidate_filename}"
 				)
 				continue
 			filename = candidate.get("filename", "artifact.bin")

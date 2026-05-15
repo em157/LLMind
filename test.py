@@ -24,6 +24,8 @@ from utils.utilities import normalize_response_params, parse_json_text, resolve_
 
 
 class SpyProgress:
+    """Test double that captures progress messages instead of printing them."""
+
     def __init__(self) -> None:
         self.infos = []
         self.oks = []
