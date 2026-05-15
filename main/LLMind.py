@@ -17,7 +17,6 @@ from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
-import sys
 
 # When running the script from the `main/` directory, sibling packages (network, cache, appdata)
 # aren't on sys.path by default. Add the repository root to sys.path so imports like
@@ -237,10 +236,10 @@ class LLMindCLI:
 					self.progress.ok(f"Request returned {status}")
 					print(body)
 					downloaded_artifacts = self._store_response_artifacts(body)
-					downloaded_artifacts_cache = self.writer.app_data_dir / "artifacts"
+					downloaded_artifacts_dir = self.writer.app_data_dir / "artifacts"
 					if downloaded_artifacts:
 						self.progress.ok(
-							f"Downloaded {len(downloaded_artifacts)} artifact(s) to {downloaded_artifacts_cache}"
+							f"Downloaded {len(downloaded_artifacts)} artifact(s) to {downloaded_artifacts_dir}"
 						)
 			elif choice == "q":
 				self.progress.ok("Goodbye.")
