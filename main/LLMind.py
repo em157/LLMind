@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import time
+from hashlib import sha256
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -31,6 +32,7 @@ from response.response_handler import extract_file_artifact_candidates
 APP_NAME = "LLMind"
 CACHE_FILENAME = "api_cache.json"
 SETTINGS_FILENAME = "settings.json"
+ARTIFACTS_DIRNAME = "artifacts"
 
 
 @dataclass
@@ -96,6 +98,41 @@ class DataWriter:
 			return {}
 		with target.open("r", encoding="utf-8") as handle:
 			return json.load(handle)
+
+	@staticmethod
+	def sanitize_filename(filename: str, default: str = "artifact.bin") -> str:
+		cleaned = Path(filename or default).name.strip()
+		if not cleaned or cleaned in {".", ".."}:
+			cleaned = default
+
+		def replace_unsafe_chars(value: str) -> str:
+			return "".join(char if char.isalnum() or char in "._-" else "_" for char in value)
+
+		sanitized = replace_unsafe_chars(cleaned)
+		if sanitized == cleaned:
+			return sanitized
+
+		digest = sha256(cleaned.encode("utf-8")).hexdigest()[:8]
+		original = Path(cleaned)
+		stem = replace_unsafe_chars(original.stem) or "artifact"
+		suffix = replace_unsafe_chars(original.suffix)
+		return f"{stem}_{digest}{suffix}"
+
+	def write_artifact(self, artifact_id: str, filename: str, data: bytes) -> Path:
+		self.ensure_appdata()
+		safe_id = self.sanitize_filename(artifact_id, default="artifact")
+		safe_name = self.sanitize_filename(filename)
+		artifact_dir = self.app_data_dir / ARTIFACTS_DIRNAME / safe_id
+		artifact_dir.mkdir(parents=True, exist_ok=True)
+		target = artifact_dir / safe_name
+		tmp = target.with_suffix(target.suffix + ".tmp")
+		with tmp.open("wb") as handle:
+			handle.write(data)
+		try:
+			os.replace(str(tmp), str(target))
+		except Exception:
+			tmp.rename(target)
+		return target
 
 
 class CacheManager:
@@ -236,7 +273,7 @@ class LLMindCLI:
 					self.progress.ok(f"Request returned {status}")
 					print(body)
 					downloaded_artifacts = self._store_response_artifacts(body)
-					downloaded_artifacts_dir = self.writer.app_data_dir / "artifacts"
+					downloaded_artifacts_dir = self.writer.app_data_dir / ARTIFACTS_DIRNAME
 					if downloaded_artifacts:
 						self.progress.ok(
 							f"Downloaded {len(downloaded_artifacts)} artifact(s) to {downloaded_artifacts_dir}"
@@ -346,8 +383,8 @@ class LLMindCLI:
 			if not isinstance(content, bytes) or not content:
 				continue
 			filename = candidate.get("filename", "artifact.bin")
-			unique_artifact_name = f"artifact_{uuid4().hex}"
-			saved_paths.append(self.writer.write_artifact(unique_artifact_name, filename, content))
+			artifact_id = f"artifact_{uuid4().hex}"
+			saved_paths.append(self.writer.write_artifact(artifact_id, filename, content))
 		return saved_paths
 
 	@staticmethod
