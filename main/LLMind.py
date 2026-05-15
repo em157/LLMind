@@ -12,10 +12,11 @@ import os
 import re
 import sys
 import time
+from uuid import uuid4
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 import sys
 
 # When running the script from the `main/` directory, sibling packages (network, cache, appdata)
@@ -25,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from network.requests import perform_api_request
 from scripts.script_mgr import get_response_param_template
+from response.response_handler import extract_file_artifact_candidates
 
 
 APP_NAME = "LLMind"
@@ -234,6 +236,12 @@ class LLMindCLI:
 				else:
 					self.progress.ok(f"Request returned {status}")
 					print(body)
+					downloaded_artifacts = self._store_response_artifacts(body)
+					downloaded_artifacts_cache = self.writer.app_data_dir / "artifacts"
+					if downloaded_artifacts:
+						self.progress.ok(
+							f"Downloaded {len(downloaded_artifacts)} artifact(s) to {downloaded_artifacts_cache}"
+						)
 			elif choice == "q":
 				self.progress.ok("Goodbye.")
 				return 0
@@ -326,6 +334,22 @@ class LLMindCLI:
 			self.progress.ok("API key cache removed.")
 			return
 		self.progress.warn("No API cache file to clear.")
+
+	def _store_response_artifacts(self, body: str) -> List[Path]:
+		try:
+			payload = json.loads(body)
+		except (TypeError, ValueError, json.JSONDecodeError):
+			payload = body
+
+		saved_paths: List[Path] = []
+		for candidate in extract_file_artifact_candidates(payload):
+			content = candidate.get("content", b"")
+			if not isinstance(content, bytes) or not content:
+				continue
+			filename = candidate.get("filename", "artifact.bin")
+			artifact_id = f"artifact_{uuid4().hex}"
+			saved_paths.append(self.writer.write_artifact(artifact_id, filename, content))
+		return saved_paths
 
 	@staticmethod
 	def _pick_file_path() -> Optional[str]:
