@@ -330,13 +330,13 @@ class LoggingTests(unittest.TestCase):
 
             try:
                 path = writer.write_artifact("artifact-123", "output.txt", b"hello")
+                self.assertTrue(path.exists())
             finally:
                 if original_appdata is None:
                     os.environ.pop("APPDATA", None)
                 else:
                     os.environ["APPDATA"] = original_appdata
 
-        self.assertTrue(path.exists())
         self.assertIn("Resolving appdata directory for artifact storage...", writer.progress.infos)
         self.assertTrue(any("Creating artifact directory:" in message for message in writer.progress.infos))
         self.assertTrue(any("Writing artifact file to temporary path:" in message for message in writer.progress.infos))
