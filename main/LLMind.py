@@ -12,11 +12,12 @@ import os
 import re
 import sys
 import time
-from urllib.parse import urlparse
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
-from typing import Optional
-import sys
+from typing import List, Optional
+from urllib.parse import urlparse
+from uuid import uuid4
 
 # When running the script from the `main/` directory, sibling packages (network, cache, appdata)
 # aren't on sys.path by default. Add the repository root to sys.path so imports like
@@ -25,11 +26,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from network.requests import perform_api_request
 from scripts.script_mgr import get_response_param_template
+from response.response_handler import extract_file_artifact_candidates
 
 
 APP_NAME = "LLMind"
 CACHE_FILENAME = "api_cache.json"
 SETTINGS_FILENAME = "settings.json"
+ARTIFACTS_DIRNAME = "artifacts"
 
 
 @dataclass
@@ -95,6 +98,44 @@ class DataWriter:
 			return {}
 		with target.open("r", encoding="utf-8") as handle:
 			return json.load(handle)
+
+	@staticmethod
+	def sanitize_filename(filename: str, default: str = "artifact.bin") -> str:
+		cleaned = Path(filename or default).name.strip()
+		if not cleaned or cleaned in {".", ".."}:
+			cleaned = default
+
+		def replace_unsafe_chars(value: str) -> str:
+			return "".join(char if char.isalnum() or char in "._-" else "_" for char in value)
+
+		sanitized = replace_unsafe_chars(cleaned)
+		if sanitized == cleaned:
+			return sanitized
+
+		digest = sha256(cleaned.encode("utf-8")).hexdigest()[:8]
+		original = Path(cleaned)
+		stem = replace_unsafe_chars(original.stem) or "artifact"
+		suffix = replace_unsafe_chars(original.suffix)
+		return f"{stem}_{digest}{suffix}"
+
+	def write_artifact(self, artifact_id: str, filename: str, data: bytes) -> Path:
+		self.ensure_appdata()
+		safe_id = self.sanitize_filename(artifact_id, default="artifact")
+		safe_name = self.sanitize_filename(filename)
+		artifact_dir = self.app_data_dir / ARTIFACTS_DIRNAME / safe_id
+		artifact_dir.mkdir(parents=True, exist_ok=True)
+		target = artifact_dir / safe_name
+		tmp = target.with_suffix(target.suffix + ".tmp")
+		with tmp.open("wb") as handle:
+			handle.write(data)
+		try:
+			os.replace(str(tmp), str(target))
+		except OSError as exc:
+			try:
+				tmp.rename(target)
+			except OSError:
+				raise exc
+		return target
 
 
 class CacheManager:
@@ -234,6 +275,12 @@ class LLMindCLI:
 				else:
 					self.progress.ok(f"Request returned {status}")
 					print(body)
+					downloaded_artifacts = self._store_response_artifacts(body)
+					downloaded_artifacts_dir = self.writer.app_data_dir / ARTIFACTS_DIRNAME
+					if downloaded_artifacts:
+						self.progress.ok(
+							f"Downloaded {len(downloaded_artifacts)} artifact(s) to {downloaded_artifacts_dir}"
+						)
 			elif choice == "q":
 				self.progress.ok("Goodbye.")
 				return 0
@@ -326,6 +373,22 @@ class LLMindCLI:
 			self.progress.ok("API key cache removed.")
 			return
 		self.progress.warn("No API cache file to clear.")
+
+	def _store_response_artifacts(self, body: str) -> List[Path]:
+		try:
+			payload = json.loads(body)
+		except (TypeError, ValueError, json.JSONDecodeError):
+			payload = body
+
+		saved_paths: List[Path] = []
+		for candidate in extract_file_artifact_candidates(payload):
+			content = candidate.get("content")
+			if content is None or not isinstance(content, bytes) or not content:
+				continue
+			filename = candidate.get("filename", "artifact.bin")
+			artifact_id = uuid4().hex
+			saved_paths.append(self.writer.write_artifact(artifact_id, filename, content))
+		return saved_paths
 
 	@staticmethod
 	def _pick_file_path() -> Optional[str]:
