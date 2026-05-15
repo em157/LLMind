@@ -136,10 +136,11 @@ class DataWriter:
 			os.replace(str(tmp), str(target))
 			self.progress.ok(f"Artifact file moved to final destination: {target}")
 		except OSError as exc:
-			self.progress.error(f"Failed to move artifact to {target}. Error: {exc}")
 			try:
 				tmp.rename(target)
+				self.progress.ok(f"Artifact file moved to final destination: {target}")
 			except OSError:
+				self.progress.error(f"Failed to move artifact to {target}. Error: {exc}")
 				raise exc
 		return target
 

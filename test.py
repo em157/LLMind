@@ -367,8 +367,8 @@ class LoggingTests(unittest.TestCase):
                     os.environ["APPDATA"] = original_appdata
 
         self.assertEqual(len(paths), 1)
-        self.assertTrue(any("Searching for artifacts in the response..." == message for message in cli.progress.infos))
-        self.assertTrue(any("Found artifact candidate." == message for message in cli.progress.infos))
+        self.assertIn("Searching for artifacts in the response...", cli.progress.infos)
+        self.assertIn("Found artifact candidate.", cli.progress.infos)
         self.assertTrue(any("Downloading and caching artifact with ID:" in message for message in cli.progress.infos))
         self.assertTrue(any("Artifact saved to:" in message for message in cli.progress.oks))
         self.assertIn("Total artifacts downloaded and saved: 1", cli.progress.oks)
