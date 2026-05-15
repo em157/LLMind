@@ -13,6 +13,14 @@ except Exception:
 from appdata.progress_output import ProgressOutput
 from cache.cache_mgr import CacheManager
 from appdata.data_writer import DataWriter
+from network.providers import (
+    build_request_headers,
+    detect_provider,
+    get_default_payload,
+    get_response_template_name,
+    inject_api_key_into_url,
+    requires_post,
+)
 from response.response_handler import (
     build_artifact_response,
     extract_file_artifact_candidates,
@@ -75,7 +83,7 @@ def _save_file_artifact(
     return artifact
 
 
-def _format_openai_response_with_artifacts(
+def _format_llm_response_with_artifacts(
     response_text: str,
     response_params: Optional[Iterable[Dict[str, Any]]],
     response_template: str,
@@ -115,13 +123,15 @@ def perform_api_request(
     method: str = "GET",
     json_payload: Optional[Dict[str, Any]] = None,
     response_params: Optional[Iterable[Dict[str, Any]]] = None,
-    response_template: str = "openai_responses",
+    response_template: Optional[str] = None,
 ) -> Tuple[int, str]:
-    """Perform a simple API request using stored API key.
+    """Perform an API request using the stored API key.
 
-    Returns (status_code, response_text). If no requests library is available,
-    falls back to urllib. Uses CacheManager to load the stored key and passes
-    it in an Authorization header as 'Bearer <key>'.
+    Detects the LLM provider from *url* and automatically applies the
+    correct authentication headers, default payload, and response template.
+
+    Returns ``(status_code, response_text)``.  A ``status_code`` of ``0``
+    signals a local error (no key, network failure, etc.).
     """
     progress = ProgressOutput()
     writer = DataWriter()
@@ -132,26 +142,34 @@ def perform_api_request(
         progress.warn("No API key available for request")
         return 0, "no-api-key"
 
-    parsed = urlparse(url)
-    is_openai_responses = (
-        parsed.netloc.lower() == "api.openai.com"
-        and parsed.path.rstrip("/") == "/v1/responses"
-    )
+    provider = detect_provider(url)
 
+    # Normalise method once and override to POST when the endpoint requires it.
     method = method.upper()
-    if is_openai_responses and method == "GET":
-        progress.warn("OpenAI /v1/responses requires POST; overriding GET to POST")
+    if requires_post(provider, url) and method == "GET":
+        progress.warn(
+            f"{provider.upper()} endpoint requires POST; overriding GET to POST"
+        )
         method = "POST"
 
-    headers = {"Authorization": f"Bearer {key}"}
-    if json_payload is not None or is_openai_responses:
+    headers = build_request_headers(provider, key)
+
+    # For generic endpoints add Content-Type only when sending a body.
+    if provider == "generic" and json_payload is not None:
         headers["Content-Type"] = "application/json"
 
-    if is_openai_responses and json_payload is None:
-        json_payload = {
-            "model": "gpt-4.1-mini",
-            "input": "Hello from LLMind",
-        }
+    # Inject the API key into the URL when the provider requires it (Gemini).
+    request_url = inject_api_key_into_url(url, provider, key)
+
+    # Use a sensible default payload for known LLM providers.
+    if json_payload is None and provider != "generic":
+        json_payload = get_default_payload(provider)
+
+    # Resolve the response-parameter template name.
+    if response_template is None:
+        response_template = get_response_template_name(provider, url)
+
+    is_llm_provider = provider != "generic"
 
     progress.step(f"Sending {method} request to {url}")
 
@@ -159,9 +177,9 @@ def perform_api_request(
     if _requests is not None:
         try:
             if method == "GET":
-                r = _requests.get(url, headers=headers, timeout=10)
+                r = _requests.get(request_url, headers=headers, timeout=10)
             else:
-                r = _requests.request(method, url, headers=headers, json=json_payload, timeout=10)
+                r = _requests.request(method, request_url, headers=headers, json=json_payload, timeout=10)
             if is_downloadable_response(r.headers):
                 return r.status_code, _store_downloadable_response(
                     r.status_code,
@@ -171,8 +189,8 @@ def perform_api_request(
                     cache,
                 )
             body = r.text
-            if is_openai_responses:
-                body = _format_openai_response_with_artifacts(
+            if is_llm_provider:
+                body = _format_llm_response_with_artifacts(
                     body,
                     response_params=response_params,
                     response_template=response_template,
@@ -190,9 +208,8 @@ def perform_api_request(
         data = None
         if json_payload is not None:
             data = json.dumps(json_payload).encode("utf-8")
-            headers["Content-Type"] = "application/json"
 
-        req = _request.Request(url, data=data, headers=headers, method=method)
+        req = _request.Request(request_url, data=data, headers=headers, method=method)
         with _request.urlopen(req, timeout=10) as resp:
             body = resp.read()
             response_headers = dict(resp.headers.items())
@@ -206,8 +223,8 @@ def perform_api_request(
                 )
             try:
                 decoded = body.decode("utf-8")
-                if is_openai_responses:
-                    decoded = _format_openai_response_with_artifacts(
+                if is_llm_provider:
+                    decoded = _format_llm_response_with_artifacts(
                         decoded,
                         response_params=response_params,
                         response_template=response_template,

@@ -18,6 +18,39 @@ DEFAULT_RESPONSE_PARAM_TEMPLATE: List[Dict[str, Any]] = [
     {"name": "total_tokens", "path": "usage.total_tokens", "default": 0},
 ]
 
+# OpenAI /v1/chat/completions (also used by xAI which shares this format).
+OPENAI_CHAT_RESPONSE_PARAM_TEMPLATE: List[Dict[str, Any]] = [
+    {"name": "response_id", "path": "id", "default": None},
+    {"name": "model", "path": "model", "default": None},
+    {"name": "finish_reason", "path": "choices.0.finish_reason", "default": None},
+    {"name": "role", "path": "choices.0.message.role", "default": None},
+    {"name": "message_text", "path": "choices.0.message.content", "default": ""},
+    {"name": "input_tokens", "path": "usage.prompt_tokens", "default": 0},
+    {"name": "output_tokens", "path": "usage.completion_tokens", "default": 0},
+    {"name": "total_tokens", "path": "usage.total_tokens", "default": 0},
+]
+
+# Anthropic /v1/messages response format.
+ANTHROPIC_RESPONSE_PARAM_TEMPLATE: List[Dict[str, Any]] = [
+    {"name": "response_id", "path": "id", "default": None},
+    {"name": "model", "path": "model", "default": None},
+    {"name": "stop_reason", "path": "stop_reason", "default": None},
+    {"name": "role", "path": "role", "default": None},
+    {"name": "message_text", "path": "content.0.text", "default": ""},
+    {"name": "input_tokens", "path": "usage.input_tokens", "default": 0},
+    {"name": "output_tokens", "path": "usage.output_tokens", "default": 0},
+]
+
+# Google Gemini generateContent response format.
+GEMINI_RESPONSE_PARAM_TEMPLATE: List[Dict[str, Any]] = [
+    {"name": "finish_reason", "path": "candidates.0.finishReason", "default": None},
+    {"name": "role", "path": "candidates.0.content.role", "default": None},
+    {"name": "message_text", "path": "candidates.0.content.parts.0.text", "default": ""},
+    {"name": "input_tokens", "path": "usageMetadata.promptTokenCount", "default": 0},
+    {"name": "output_tokens", "path": "usageMetadata.candidatesTokenCount", "default": 0},
+    {"name": "total_tokens", "path": "usageMetadata.totalTokenCount", "default": 0},
+]
+
 
 def parse_json_text(response_text: str) -> Optional[Any]:
     try:
