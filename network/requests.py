@@ -15,10 +15,11 @@ from cache.cache_mgr import CacheManager
 from appdata.data_writer import DataWriter
 from response.response_handler import (
     build_artifact_response,
-    format_parameterized_response,
+    extract_file_artifact_candidates,
     get_download_filename,
     is_downloadable_response,
     normalize_headers,
+    parameterize_json_response,
 )
 
 
@@ -46,6 +47,67 @@ def _store_downloadable_response(
     }
     cache.save_artifact_record(artifact)
     return build_artifact_response(status_code, artifact, normalized_headers)
+
+
+def _save_file_artifact(
+    filename: str,
+    content: bytes,
+    mime: str,
+    writer: DataWriter,
+    cache: CacheManager,
+    source_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    artifact_id = f"artifact_{uuid4().hex}"
+    safe_filename = writer.sanitize_filename(filename)
+    path = writer.write_artifact(artifact_id, safe_filename, content)
+    artifact = {
+        "id": artifact_id,
+        "filename": safe_filename,
+        "mime": mime,
+        "content_type": mime,
+        "url": writer.file_url(path),
+        "path": str(path),
+        "size": len(content),
+    }
+    if source_url:
+        artifact["source_url"] = source_url
+    cache.save_artifact_record(artifact)
+    return artifact
+
+
+def _format_openai_response_with_artifacts(
+    response_text: str,
+    response_params: Optional[Iterable[Dict[str, Any]]],
+    response_template: str,
+    writer: DataWriter,
+    cache: CacheManager,
+) -> str:
+    parameterized = parameterize_json_response(
+        response_text=response_text,
+        response_params=response_params,
+        template_name=response_template,
+    )
+    saved_artifacts = []
+    for candidate in extract_file_artifact_candidates(parameterized):
+        try:
+            content = candidate.get("content", b"")
+            if not isinstance(content, bytes) or not content:
+                continue
+            saved_artifacts.append(
+                _save_file_artifact(
+                    candidate.get("filename", "artifact.bin"),
+                    content,
+                    candidate.get("mime", "application/octet-stream"),
+                    writer,
+                    cache,
+                    candidate.get("source_url"),
+                )
+            )
+        except Exception:
+            continue
+    if saved_artifacts:
+        parameterized["artifacts"] = saved_artifacts
+    return json.dumps(parameterized, indent=2, ensure_ascii=False)
 
 
 def perform_api_request(
@@ -110,10 +172,12 @@ def perform_api_request(
                 )
             body = r.text
             if is_openai_responses:
-                body = format_parameterized_response(
+                body = _format_openai_response_with_artifacts(
                     body,
                     response_params=response_params,
-                    template_name=response_template,
+                    response_template=response_template,
+                    writer=writer,
+                    cache=cache,
                 )
             return r.status_code, body
         except Exception as exc:
@@ -143,10 +207,12 @@ def perform_api_request(
             try:
                 decoded = body.decode("utf-8")
                 if is_openai_responses:
-                    decoded = format_parameterized_response(
+                    decoded = _format_openai_response_with_artifacts(
                         decoded,
                         response_params=response_params,
-                        template_name=response_template,
+                        response_template=response_template,
+                        writer=writer,
+                        cache=cache,
                     )
                 return resp.getcode(), decoded
             except Exception:
