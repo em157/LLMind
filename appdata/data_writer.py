@@ -129,9 +129,9 @@ class DataWriter:
             try:
                 tmp.rename(target)
                 self.progress.ok(f"Artifact file moved to final destination: {target}")
-            except OSError:
+            except OSError as rename_exc:
                 self.progress.error(f"Failed to move artifact to {target}. Error: {exc}")
-                raise
+                raise exc from rename_exc
         try:
             if os.name == "posix":
                 target.chmod(0o600)

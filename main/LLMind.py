@@ -139,9 +139,9 @@ class DataWriter:
 			try:
 				tmp.rename(target)
 				self.progress.ok(f"Artifact file moved to final destination: {target}")
-			except OSError:
+			except OSError as rename_exc:
 				self.progress.error(f"Failed to move artifact to {target}. Error: {exc}")
-				raise exc
+				raise exc from rename_exc
 		return target
 
 
@@ -397,7 +397,10 @@ class LLMindCLI:
 			self.progress.info("Found artifact candidate.")
 			content = candidate.get("content")
 			if content is None or not isinstance(content, bytes) or not content:
-				self.progress.warn(f"Artifact content is empty or invalid. Skipping artifact: {candidate}")
+				invalid_filename = candidate.get("filename", "artifact.bin")
+				self.progress.warn(
+					f"Artifact content is empty or invalid. Skipping artifact: {invalid_filename}"
+				)
 				continue
 			filename = candidate.get("filename", "artifact.bin")
 			artifact_id = uuid4().hex
