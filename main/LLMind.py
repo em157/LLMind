@@ -16,8 +16,8 @@ from hashlib import sha256
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
-from urllib.parse import urlparse
 from uuid import uuid4
+from urllib.parse import urlparse
 
 # When running the script from the `main/` directory, sibling packages (network, cache, appdata)
 # aren't on sys.path by default. Add the repository root to sys.path so imports like
@@ -130,8 +130,11 @@ class DataWriter:
 			handle.write(data)
 		try:
 			os.replace(str(tmp), str(target))
-		except Exception:
-			tmp.rename(target)
+		except OSError as exc:
+			try:
+				tmp.rename(target)
+			except OSError:
+				raise exc
 		return target
 
 
@@ -379,8 +382,8 @@ class LLMindCLI:
 
 		saved_paths: List[Path] = []
 		for candidate in extract_file_artifact_candidates(payload):
-			content = candidate.get("content", b"")
-			if not isinstance(content, bytes) or not content:
+			content = candidate.get("content")
+			if content is None or not isinstance(content, bytes) or not content:
 				continue
 			filename = candidate.get("filename", "artifact.bin")
 			artifact_id = f"artifact_{uuid4().hex}"
