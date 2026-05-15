@@ -12,12 +12,12 @@ import os
 import re
 import sys
 import time
-from hashlib import sha256
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import List, Optional
-from uuid import uuid4
 from urllib.parse import urlparse
+from uuid import uuid4
 
 # When running the script from the `main/` directory, sibling packages (network, cache, appdata)
 # aren't on sys.path by default. Add the repository root to sys.path so imports like
@@ -386,7 +386,7 @@ class LLMindCLI:
 			if content is None or not isinstance(content, bytes) or not content:
 				continue
 			filename = candidate.get("filename", "artifact.bin")
-			artifact_id = f"artifact_{uuid4().hex}"
+			artifact_id = uuid4().hex
 			saved_paths.append(self.writer.write_artifact(artifact_id, filename, content))
 		return saved_paths
 
