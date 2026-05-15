@@ -1,10 +1,67 @@
 from __future__ import annotations
 
+from email.message import Message
 import json
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from scripts.script_mgr import get_response_param_template
 from utils.utilities import parse_json_text, normalize_response_params, resolve_param_path
+
+
+def _content_disposition_message(headers: Optional[Dict[str, Any]]) -> Message:
+    message = Message()
+    disposition = normalize_headers(headers).get("content-disposition", "")
+    if disposition:
+        message["Content-Disposition"] = disposition
+    return message
+
+
+def normalize_headers(headers: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if not headers:
+        return {}
+    return {str(key).lower(): str(value) for key, value in dict(headers).items()}
+
+
+def get_download_filename(headers: Optional[Dict[str, Any]], default: str = "artifact.bin") -> str:
+    normalized = normalize_headers(headers)
+    filename = _content_disposition_message(normalized).get_filename()
+    if filename:
+        safe_name = Path(filename.replace("\\", "/")).name.strip()
+        if safe_name and safe_name not in {".", ".."}:
+            return safe_name
+        return default
+    content_type = normalized.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type.startswith("text/"):
+        return "artifact.txt"
+    return default
+
+
+def is_downloadable_response(headers: Optional[Dict[str, Any]]) -> bool:
+    message = _content_disposition_message(headers)
+    return message.get_content_disposition() == "attachment" or bool(message.get_filename())
+
+
+def build_artifact_response(
+    status_code: int,
+    artifact: Dict[str, Any],
+    headers: Optional[Dict[str, Any]] = None,
+) -> str:
+    normalized = normalize_headers(headers)
+    return json.dumps(
+        {
+            "status": "ok" if 200 <= status_code < 400 else "error",
+            "status_code": status_code,
+            "artifact": artifact,
+            "headers": {
+                key: normalized[key]
+                for key in ("content-type", "content-disposition", "content-length", "cache-control")
+                if key in normalized
+            },
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
 
 
 def parameterize_json_response(

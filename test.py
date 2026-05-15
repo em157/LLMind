@@ -3,9 +3,20 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
-from response.response_handler import format_parameterized_response, parameterize_json_response
+from appdata.data_writer import DataWriter
+from cache.cache_mgr import CacheManager
+import network.requests as network_requests
+from response.response_handler import (
+    format_parameterized_response,
+    get_download_filename,
+    is_downloadable_response,
+    parameterize_json_response,
+)
 from utils.utilities import normalize_response_params, parse_json_text, resolve_param_path
 
 
@@ -75,6 +86,63 @@ class ResponseHandlerTests(unittest.TestCase):
         rendered = format_parameterized_response(self.sample_text)
         self.assertIn('\n  "response_params"', rendered)
         self.assertIn("Hello world", rendered)
+
+    def test_download_header_helpers_detect_attachment_filename(self) -> None:
+        headers = {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Content-Disposition": 'attachment; filename="analysis.txt"',
+        }
+        self.assertTrue(is_downloadable_response(headers))
+        self.assertEqual(get_download_filename(headers), "analysis.txt")
+
+    def test_download_filename_strips_path_segments(self) -> None:
+        headers = {"Content-Disposition": 'attachment; filename="../nested/evil.txt"'}
+        self.assertEqual(get_download_filename(headers), "evil.txt")
+
+
+class NetworkDownloadTests(unittest.TestCase):
+    def test_perform_api_request_saves_downloadable_response_artifact(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+
+        class FakeResponse:
+            status_code = 200
+            headers = {
+                "Content-Type": "text/plain; charset=utf-8",
+                "Content-Disposition": 'attachment; filename="output.txt"',
+                "Content-Length": "11",
+            }
+            content = b"Hello world"
+            text = "Hello world"
+
+        class FakeRequests:
+            @staticmethod
+            def get(*_args, **_kwargs):
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            writer = DataWriter()
+            CacheManager(writer).save_api_key("sk_test_key_for_downloads")
+
+            try:
+                with patch("network.requests._requests", FakeRequests):
+                    status, body = network_requests.perform_api_request("https://example.test/file.txt")
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+            self.assertEqual(status, 200)
+            payload = json.loads(body)
+            artifact = payload["artifact"]
+            self.assertEqual(artifact["filename"], "output.txt")
+            self.assertEqual(artifact["mime"], "text/plain")
+            self.assertTrue(os.path.exists(artifact["path"]))
+            records = CacheManager(writer).load_artifact_records()
+            self.assertEqual(records[-1]["id"], artifact["id"])
+            with open(artifact["path"], "rb") as handle:
+                self.assertEqual(handle.read(), b"Hello world")
 
 
 if __name__ == "__main__":

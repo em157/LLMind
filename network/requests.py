@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from uuid import uuid4
 from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -12,7 +13,39 @@ except Exception:
 from appdata.progress_output import ProgressOutput
 from cache.cache_mgr import CacheManager
 from appdata.data_writer import DataWriter
-from response.response_handler import format_parameterized_response
+from response.response_handler import (
+    build_artifact_response,
+    format_parameterized_response,
+    get_download_filename,
+    is_downloadable_response,
+    normalize_headers,
+)
+
+
+def _store_downloadable_response(
+    status_code: int,
+    body: bytes,
+    headers: Optional[Dict[str, Any]],
+    writer: DataWriter,
+    cache: CacheManager,
+) -> str:
+    normalized_headers = normalize_headers(headers)
+    filename = writer.sanitize_filename(get_download_filename(normalized_headers))
+    artifact_id = f"artifact_{uuid4().hex}"
+    path = writer.write_artifact(artifact_id, filename, body)
+    content_type = normalized_headers.get("content-type", "application/octet-stream")
+    mime = content_type.split(";", 1)[0].strip() or "application/octet-stream"
+    artifact = {
+        "id": artifact_id,
+        "filename": filename,
+        "mime": mime,
+        "content_type": content_type,
+        "url": writer.file_url(path),
+        "path": str(path),
+        "size": len(body),
+    }
+    cache.save_artifact_record(artifact)
+    return build_artifact_response(status_code, artifact, normalized_headers)
 
 
 def perform_api_request(
@@ -67,6 +100,14 @@ def perform_api_request(
                 r = _requests.get(url, headers=headers, timeout=10)
             else:
                 r = _requests.request(method, url, headers=headers, json=json_payload, timeout=10)
+            if is_downloadable_response(r.headers):
+                return r.status_code, _store_downloadable_response(
+                    r.status_code,
+                    r.content,
+                    r.headers,
+                    writer,
+                    cache,
+                )
             body = r.text
             if is_openai_responses:
                 body = format_parameterized_response(
@@ -90,6 +131,15 @@ def perform_api_request(
         req = _request.Request(url, data=data, headers=headers, method=method)
         with _request.urlopen(req, timeout=10) as resp:
             body = resp.read()
+            response_headers = dict(resp.headers.items())
+            if is_downloadable_response(response_headers):
+                return resp.getcode(), _store_downloadable_response(
+                    resp.getcode(),
+                    body,
+                    response_headers,
+                    writer,
+                    cache,
+                )
             try:
                 decoded = body.decode("utf-8")
                 if is_openai_responses:

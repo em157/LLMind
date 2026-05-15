@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import json
+import os
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from appdata.data_writer import DataWriter
 
 
 CACHE_FILENAME = "api_cache.json"
+ARTIFACT_CACHE_FILENAME = "artifact_cache.json"
+MAX_ARTIFACT_RECORDS = 100
 
 
 class CacheManager:
@@ -43,3 +45,50 @@ class CacheManager:
             return self.writer.write_file(dest, data)
         except Exception:
             return None
+
+    def save_artifact_record(self, artifact: Dict[str, Any]) -> Path:
+        """Save artifact metadata with a timestamp and cap retained records.
+
+        Args:
+            artifact: Artifact metadata returned to the caller.
+
+        Returns:
+            Path to the artifact cache JSON file.
+        """
+        lock_path = self._acquire_artifact_cache_lock()
+        try:
+            payload = self.writer.read_json(ARTIFACT_CACHE_FILENAME)
+            records = payload.get("artifacts", [])
+            if not isinstance(records, list):
+                records = []
+            record = dict(artifact)
+            record["created_at"] = int(time.time())
+            records.append(record)
+            return self.writer.write_json(ARTIFACT_CACHE_FILENAME, {"artifacts": records[-MAX_ARTIFACT_RECORDS:]})
+        finally:
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+
+    def load_artifact_records(self) -> List[Dict[str, Any]]:
+        """Load artifact metadata records and ignore malformed cache entries."""
+        payload = self.writer.read_json(ARTIFACT_CACHE_FILENAME)
+        records = payload.get("artifacts", [])
+        if not isinstance(records, list):
+            return []
+        return [record for record in records if isinstance(record, dict)]
+
+    def _acquire_artifact_cache_lock(self) -> Path:
+        self.writer.ensure_appdata()
+        lock_path = self.writer.app_data_dir / f"{ARTIFACT_CACHE_FILENAME}.lock"
+        deadline = time.time() + 5
+        while True:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                return lock_path
+            except FileExistsError:
+                if time.time() >= deadline:
+                    raise TimeoutError("timed out waiting for artifact cache lock")
+                time.sleep(0.05)
