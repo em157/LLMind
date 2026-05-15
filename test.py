@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from appdata.data_writer import DataWriter
 from cache.cache_mgr import CacheManager
+from main.LLMind import LLMindCLI
 import network.requests as network_requests
 from response.response_handler import (
     extract_file_artifact_candidates,
@@ -20,6 +21,28 @@ from response.response_handler import (
     parameterize_json_response,
 )
 from utils.utilities import normalize_response_params, parse_json_text, resolve_param_path
+
+
+class SpyProgress:
+    """Test double that captures progress messages instead of printing them."""
+
+    def __init__(self) -> None:
+        self.infos = []
+        self.oks = []
+        self.warns = []
+        self.errors = []
+
+    def info(self, message: str) -> None:
+        self.infos.append(message)
+
+    def ok(self, message: str) -> None:
+        self.oks.append(message)
+
+    def warn(self, message: str) -> None:
+        self.warns.append(message)
+
+    def error(self, message: str) -> None:
+        self.errors.append(message)
 
 
 class ResponseHandlerTests(unittest.TestCase):
@@ -296,6 +319,83 @@ class NetworkDownloadTests(unittest.TestCase):
                 self.assertEqual(handle.read(), b"Ai for humanity")
             records = CacheManager(writer).load_artifact_records()
             self.assertEqual(records[-1]["id"], artifact["id"])
+
+
+class LoggingTests(unittest.TestCase):
+    def test_write_artifact_logs_storage_steps(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            writer = DataWriter()
+            writer.progress = SpyProgress()
+
+            try:
+                path = writer.write_artifact("artifact-123", "output.txt", b"hello")
+                self.assertTrue(path.exists())
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        self.assertIn("Resolving appdata directory for artifact storage...", writer.progress.infos)
+        self.assertTrue(any("Creating artifact directory:" in message for message in writer.progress.infos))
+        self.assertTrue(any("Writing artifact file to temporary path:" in message for message in writer.progress.infos))
+        self.assertTrue(any("Artifact file moved to final destination:" in message for message in writer.progress.oks))
+
+    def test_store_response_artifacts_logs_search_and_summary(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+        body = json.dumps(
+            {
+                "response_params": {
+                    "message_text": "Created `notes.txt`:\n\n```txt\nhello world\n```"
+                }
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            cli = LLMindCLI()
+            cli.progress = SpyProgress()
+            cli.writer.progress = cli.progress
+
+            try:
+                paths = cli._store_response_artifacts(body)
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        self.assertEqual(len(paths), 1)
+        self.assertIn("Searching for artifacts in the response...", cli.progress.infos)
+        self.assertIn("Found artifact candidate.", cli.progress.infos)
+        self.assertTrue(any("Downloading and caching artifact with ID:" in message for message in cli.progress.infos))
+        self.assertTrue(any("Artifact saved to:" in message for message in cli.progress.oks))
+        self.assertIn("Total artifacts downloaded and saved: 1", cli.progress.oks)
+
+    def test_run_logs_appdata_initialization(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            cli = LLMindCLI()
+            cli.progress = SpyProgress()
+            cli.writer.progress = cli.progress
+
+            try:
+                with patch.object(cli, "show_banner"), patch("builtins.input", side_effect=["q"]):
+                    exit_code = cli.run()
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Initializing appdata...", cli.progress.infos)
+        self.assertTrue(any("AppData directory resolved to:" in message for message in cli.progress.infos))
 
 
 if __name__ == "__main__":
