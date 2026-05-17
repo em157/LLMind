@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from uuid import uuid4
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 try:
@@ -13,14 +13,18 @@ except Exception:
 from appdata.progress_output import ProgressOutput
 from cache.cache_mgr import CacheManager
 from appdata.data_writer import DataWriter
+from hooks.hook_registry import HookRegistry
+from hooks.provider_adapters import render_provider_tools
 from network.providers import (
     build_request_headers,
     detect_provider,
     get_default_payload,
     get_response_template_name,
     inject_api_key_into_url,
+    normalize_provider_url,
     requires_post,
 )
+from response.model_hook_processor import process_model_response_with_hooks
 from response.response_handler import (
     build_artifact_response,
     extract_file_artifact_candidates,
@@ -32,6 +36,25 @@ from response.response_handler import (
 
 
 MAX_REMOTE_ARTIFACT_BYTES = 10 * 1024 * 1024
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
+OPENAI_IMAGE_TIMEOUT_SECONDS = 120
+MAX_HOOK_ORCHESTRATION_STEPS = 3
+
+
+def _format_http_error(status_code: int, reason: Optional[str], body: str = "") -> str:
+    reason_text = (reason or "").strip()
+    head = f"http-error: HTTP {status_code}"
+    if reason_text:
+        head = f"{head} {reason_text}"
+
+    body_text = (body or "").strip()
+    if not body_text:
+        return head
+
+    # Keep errors readable in the terminal while still preserving details.
+    if len(body_text) > 3000:
+        body_text = body_text[:3000] + "... [truncated]"
+    return f"{head}: {body_text}"
 
 
 def _fetch_remote_artifact(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -143,13 +166,16 @@ def _save_file_artifact(
     return artifact
 
 
-def _format_llm_response_with_artifacts(
+def _build_llm_response_bundle(
     response_text: str,
+    provider: str,
     response_params: Optional[Iterable[Dict[str, Any]]],
     response_template: str,
     writer: DataWriter,
     cache: CacheManager,
-) -> str:
+    execute_hook_calls: bool = False,
+    resolved_executables: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     parameterized = parameterize_json_response(
         response_text=response_text,
         response_params=response_params,
@@ -182,7 +208,191 @@ def _format_llm_response_with_artifacts(
             continue
     if saved_artifacts:
         parameterized["artifacts"] = saved_artifacts
+
+    hook_registry = HookRegistry(app_name=writer.app_name)
+    hook_registry.register_builtin_hooks()
+    parameterized["hook_processing"] = process_model_response_with_hooks(
+        payload=parameterized.get("raw_response"),
+        provider=provider,
+        registry=hook_registry,
+        app_data_dir=writer.app_data_dir,
+        execute=execute_hook_calls,
+        resolved_executables=resolved_executables,
+    )
+
+    return parameterized
+
+
+def _format_llm_response_with_artifacts(
+    response_text: str,
+    provider: str,
+    response_params: Optional[Iterable[Dict[str, Any]]],
+    response_template: str,
+    writer: DataWriter,
+    cache: CacheManager,
+    execute_hook_calls: bool = False,
+    resolved_executables: Optional[Dict[str, str]] = None,
+) -> str:
+    parameterized = _build_llm_response_bundle(
+        response_text=response_text,
+        provider=provider,
+        response_params=response_params,
+        response_template=response_template,
+        writer=writer,
+        cache=cache,
+        execute_hook_calls=execute_hook_calls,
+        resolved_executables=resolved_executables,
+    )
+
     return json.dumps(parameterized, indent=2, ensure_ascii=False)
+
+
+def _build_openai_chat_followup_payload(
+    request_payload: Dict[str, Any],
+    bundle: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Build a follow-up payload by appending assistant tool_calls + tool outputs."""
+    messages = request_payload.get("messages")
+    if not isinstance(messages, list):
+        return None
+
+    raw_response = bundle.get("raw_response")
+    if not isinstance(raw_response, dict):
+        return None
+
+    hook_processing = bundle.get("hook_processing")
+    if not isinstance(hook_processing, dict):
+        return None
+
+    choices = raw_response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return None
+    assistant_message = first_choice.get("message")
+    if not isinstance(assistant_message, dict):
+        return None
+
+    tool_calls = assistant_message.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return None
+
+    hook_results = hook_processing.get("hook_results", [])
+    if not isinstance(hook_results, list) or not hook_results:
+        return None
+
+    followup_payload = dict(request_payload)
+    next_messages: List[Dict[str, Any]] = list(messages)
+    next_messages.append(
+        {
+            "role": "assistant",
+            "content": assistant_message.get("content"),
+            "tool_calls": tool_calls,
+        }
+    )
+
+    for index, tool_call in enumerate(tool_calls):
+        if not isinstance(tool_call, dict):
+            continue
+        tool_id = tool_call.get("id")
+        if not isinstance(tool_id, str) or not tool_id.strip():
+            continue
+
+        result: Dict[str, Any]
+        if index < len(hook_results) and isinstance(hook_results[index], dict):
+            result = hook_results[index]
+        else:
+            result = {
+                "hook_name": "unknown",
+                "success": False,
+                "message": "No matching hook execution result found",
+                "details": {},
+            }
+
+        tool_content = json.dumps(
+            {
+                "hook_name": result.get("hook_name"),
+                "success": bool(result.get("success", False)),
+                "message": result.get("message", ""),
+                "details": result.get("details", {}),
+            },
+            ensure_ascii=False,
+        )
+        next_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_id,
+                "content": tool_content,
+            }
+        )
+
+    followup_payload["messages"] = next_messages
+    return followup_payload
+
+
+def _run_openai_chat_hook_orchestration(
+    request_payload: Dict[str, Any],
+    initial_bundle: Dict[str, Any],
+    send_followup_request: Callable[[Dict[str, Any]], Tuple[int, str, str]],
+    provider: str,
+    response_params: Optional[Iterable[Dict[str, Any]]],
+    response_template: str,
+    writer: DataWriter,
+    cache: CacheManager,
+    resolved_executables: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Run a bounded hook orchestration loop for OpenAI-chat style tool calls."""
+    current_payload = request_payload
+    latest_bundle = initial_bundle
+    iterations: List[Dict[str, Any]] = []
+
+    for step in range(1, MAX_HOOK_ORCHESTRATION_STEPS + 1):
+        followup_payload = _build_openai_chat_followup_payload(current_payload, latest_bundle)
+        if followup_payload is None:
+            break
+
+        status_code, response_text, reason = send_followup_request(followup_payload)
+        if status_code >= 400:
+            latest_bundle["orchestration"] = {
+                "enabled": True,
+                "iterations": iterations,
+                "stopped_reason": "followup_http_error",
+                "error": _format_http_error(status_code, reason, response_text),
+            }
+            return latest_bundle
+
+        next_bundle = _build_llm_response_bundle(
+            response_text=response_text,
+            provider=provider,
+            response_params=response_params,
+            response_template=response_template,
+            writer=writer,
+            cache=cache,
+            execute_hook_calls=True,
+            resolved_executables=resolved_executables,
+        )
+        hook_processing = next_bundle.get("hook_processing", {})
+        executed_hooks = 0
+        if isinstance(hook_processing, dict):
+            hook_results = hook_processing.get("hook_results", [])
+            if isinstance(hook_results, list):
+                executed_hooks = len(hook_results)
+
+        iterations.append({"step": step, "executed_hook_calls": executed_hooks})
+        latest_bundle = next_bundle
+        current_payload = followup_payload
+
+        if executed_hooks == 0:
+            break
+
+    latest_bundle["orchestration"] = {
+        "enabled": True,
+        "iterations": iterations,
+        "max_steps": MAX_HOOK_ORCHESTRATION_STEPS,
+    }
+    return latest_bundle
 
 
 def perform_api_request(
@@ -191,11 +401,20 @@ def perform_api_request(
     json_payload: Optional[Dict[str, Any]] = None,
     response_params: Optional[Iterable[Dict[str, Any]]] = None,
     response_template: Optional[str] = None,
+    api_key: Optional[str] = None,
+    execute_hook_calls: bool = False,
+    resolved_executables: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, str]:
     """Perform an API request using the stored API key.
 
     Detects the LLM provider from *url* and automatically applies the
     correct authentication headers, default payload, and response template.
+
+    *api_key* overrides the cached key when provided (e.g. when the user has
+    selected a specific key from a multi-key store).
+
+    *execute_hook_calls* controls whether extracted structured tool/function
+    calls are validated only (default) or also executed via the hook registry.
 
     Returns ``(status_code, response_text)``.  A ``status_code`` of ``0``
     signals a local error (no key, network failure, etc.).
@@ -204,16 +423,19 @@ def perform_api_request(
     writer = DataWriter()
     cache = CacheManager(writer)
 
-    key = cache.load_api_key()
+    key = api_key or cache.load_api_key()
     if not key:
         progress.warn("No API key available for request")
         return 0, "no-api-key"
 
     provider = detect_provider(url)
+    effective_url, url_warning = normalize_provider_url(provider, url)
+    if url_warning:
+        progress.warn(url_warning)
 
     # Normalise method once and override to POST when the endpoint requires it.
     method = method.upper()
-    if requires_post(provider, url) and method == "GET":
+    if requires_post(provider, effective_url) and method == "GET":
         progress.warn(
             f"{provider.upper()} endpoint requires POST; overriding GET to POST"
         )
@@ -226,27 +448,46 @@ def perform_api_request(
         headers["Content-Type"] = "application/json"
 
     # Inject the API key into the URL when the provider requires it (Gemini).
-    request_url = inject_api_key_into_url(url, provider, key)
+    request_url = inject_api_key_into_url(effective_url, provider, key)
 
     # Use a sensible default payload for known LLM providers.
     if json_payload is None and provider != "generic":
-        json_payload = get_default_payload(provider)
+        json_payload = get_default_payload(provider, url=effective_url)
 
-    # Resolve the response-parameter template name.
+    # Resolve the response-parameter template name first so tool rendering
+    # can select the correct format (e.g. Responses API vs Chat Completions).
     if response_template is None:
-        response_template = get_response_template_name(provider, url)
+        response_template = get_response_template_name(provider, effective_url)
+
+    # Auto-attach tool schemas for supported providers unless already set.
+    if provider != "generic" and isinstance(json_payload, dict):
+        if "tools" not in json_payload:
+            json_payload.update(render_provider_tools(provider, response_template=response_template))
 
     is_llm_provider = provider != "generic"
+    timeout_seconds = (
+        OPENAI_IMAGE_TIMEOUT_SECONDS
+        if response_template == "openai_images"
+        else DEFAULT_REQUEST_TIMEOUT_SECONDS
+    )
 
-    progress.step(f"Sending {method} request to {url}")
+    progress.step(f"Sending {method} request to {request_url}")
 
     # Prefer requests if installed
     if _requests is not None:
         try:
             if method == "GET":
-                r = _requests.get(request_url, headers=headers, timeout=10)
+                r = _requests.get(request_url, headers=headers, timeout=timeout_seconds)
             else:
-                r = _requests.request(method, request_url, headers=headers, json=json_payload, timeout=10)
+                r = _requests.request(
+                    method,
+                    request_url,
+                    headers=headers,
+                    json=json_payload,
+                    timeout=timeout_seconds,
+                )
+            if r.status_code >= 400:
+                return r.status_code, _format_http_error(r.status_code, getattr(r, "reason", ""), r.text)
             if is_downloadable_response(r.headers):
                 return r.status_code, _store_downloadable_response(
                     r.status_code,
@@ -257,13 +498,50 @@ def perform_api_request(
                 )
             body = r.text
             if is_llm_provider:
-                body = _format_llm_response_with_artifacts(
-                    body,
+                bundle = _build_llm_response_bundle(
+                    response_text=body,
+                    provider=provider,
                     response_params=response_params,
                     response_template=response_template,
                     writer=writer,
                     cache=cache,
+                    execute_hook_calls=execute_hook_calls,
+                    resolved_executables=resolved_executables,
                 )
+                if (
+                    execute_hook_calls
+                    and response_template == "openai_chat"
+                    and provider in {"openai", "xai", "deepseek", "mistral"}
+                    and isinstance(json_payload, dict)
+                ):
+                    progress.step("Submitting hook results for follow-up orchestration", duration_seconds=0)
+
+                    def _send_followup(payload: Dict[str, Any]) -> Tuple[int, str, str]:
+                        followup_response = _requests.request(
+                            method,
+                            request_url,
+                            headers=headers,
+                            json=payload,
+                            timeout=timeout_seconds,
+                        )
+                        return (
+                            followup_response.status_code,
+                            followup_response.text,
+                            str(getattr(followup_response, "reason", "")),
+                        )
+
+                    bundle = _run_openai_chat_hook_orchestration(
+                        request_payload=json_payload,
+                        initial_bundle=bundle,
+                        send_followup_request=_send_followup,
+                        provider=provider,
+                        response_params=response_params,
+                        response_template=response_template,
+                        writer=writer,
+                        cache=cache,
+                        resolved_executables=resolved_executables,
+                    )
+                body = json.dumps(bundle, indent=2, ensure_ascii=False)
             return r.status_code, body
         except Exception as exc:
             return 0, f"requests-error: {exc}"
@@ -277,7 +555,7 @@ def perform_api_request(
             data = json.dumps(json_payload).encode("utf-8")
 
         req = _request.Request(request_url, data=data, headers=headers, method=method)
-        with _request.urlopen(req, timeout=10) as resp:
+        with _request.urlopen(req, timeout=timeout_seconds) as resp:
             body = resp.read()
             response_headers = dict(resp.headers.items())
             if is_downloadable_response(response_headers):
@@ -293,13 +571,35 @@ def perform_api_request(
                 if is_llm_provider:
                     decoded = _format_llm_response_with_artifacts(
                         decoded,
+                        provider=provider,
                         response_params=response_params,
                         response_template=response_template,
                         writer=writer,
                         cache=cache,
+                        execute_hook_calls=execute_hook_calls,
+                        resolved_executables=resolved_executables,
                     )
                 return resp.getcode(), decoded
             except Exception:
                 return resp.getcode(), str(body)
     except Exception as exc:
+        try:
+            from urllib import error as _urlerror
+
+            if isinstance(exc, _urlerror.HTTPError):
+                response_body = ""
+                try:
+                    raw_body = exc.read()
+                    if isinstance(raw_body, bytes):
+                        response_body = raw_body.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    response_body = ""
+
+                return exc.code, _format_http_error(exc.code, str(exc.reason), response_body)
+        except Exception:
+            pass
+
+        if isinstance(exc, TimeoutError):
+            return 0, f"timeout-error: request timed out after {timeout_seconds}s"
+
         return 0, f"urllib-error: {exc}"

@@ -300,6 +300,55 @@ def _candidates_from_openai_image_generation_payload(payload: Any) -> Iterable[D
     return candidates
 
 
+def _candidates_from_openai_images_payload(payload: Any) -> Iterable[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+
+    data_items = payload.get("data")
+    if not isinstance(data_items, list):
+        return []
+
+    candidates = []
+    image_index = 1
+    for item in data_items:
+        if not isinstance(item, dict):
+            continue
+
+        raw_base64 = item.get("b64_json")
+        if isinstance(raw_base64, str) and raw_base64.strip():
+            try:
+                content = base64.b64decode(raw_base64, validate=True)
+            except Exception:
+                content = b""
+            if content:
+                candidates.append(
+                    {
+                        "filename": f"image_generation_{image_index}.png",
+                        "mime": "image/png",
+                        "content": content,
+                        "source_url": None,
+                    }
+                )
+                image_index += 1
+                continue
+
+        image_url = item.get("url")
+        if isinstance(image_url, str) and image_url.strip():
+            filename = _filename_from_download_link(f"image_generation_{image_index}.png", image_url)
+            candidates.append(
+                {
+                    "filename": filename,
+                    "mime": _mime_from_filename(filename, default="image/png"),
+                    "content": None,
+                    "source_url": image_url,
+                    "remote_fetch": True,
+                }
+            )
+            image_index += 1
+
+    return candidates
+
+
 def extract_file_artifact_candidates_from_text(text: str) -> Iterable[Dict[str, Any]]:
     """Find downloadable file artifacts described in generated response text."""
     if not isinstance(text, str) or not text.strip():
@@ -385,6 +434,8 @@ def extract_file_artifact_candidates(payload: Any) -> Iterable[Dict[str, Any]]:
 
     for candidate in _candidates_from_openai_image_generation_payload(payload):
         append_candidate(candidate)
+    for candidate in _candidates_from_openai_images_payload(payload):
+        append_candidate(candidate)
 
     def visit(value: Any) -> None:
         if isinstance(value, str):
@@ -396,6 +447,8 @@ def extract_file_artifact_candidates(payload: Any) -> Iterable[Dict[str, Any]]:
             return
         if isinstance(value, dict):
             for candidate in _candidates_from_openai_image_generation_payload(value):
+                append_candidate(candidate)
+            for candidate in _candidates_from_openai_images_payload(value):
                 append_candidate(candidate)
             for child in value.values():
                 visit(child)

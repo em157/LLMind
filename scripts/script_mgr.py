@@ -19,6 +19,10 @@ RESPONSE_PARAM_TEMPLATES: Dict[str, Dict[str, Any]] = {
         "description": "Parameter mapping for OpenAI /v1/chat/completions JSON bodies.",
         "response_params": get_response_params_copy(OPENAI_CHAT_RESPONSE_PARAM_TEMPLATE),
     },
+    "openai_images": {
+        "description": "Parameter mapping for OpenAI /v1/images/generations JSON bodies.",
+        "response_params": get_response_params_copy(),
+    },
     "anthropic_messages": {
         "description": "Parameter mapping for Anthropic /v1/messages JSON bodies.",
         "response_params": get_response_params_copy(ANTHROPIC_RESPONSE_PARAM_TEMPLATE),

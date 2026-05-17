@@ -9,7 +9,9 @@ and ``generic`` (any unrecognised host).
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import json as _json
+import urllib.request as _urllib_request
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 
@@ -20,6 +22,32 @@ DEFAULT_MODELS: Dict[str, str] = {
     "xai": "grok-3",
     "gemini": "gemini-2.0-flash",
 }
+
+
+def _is_openai_image_model(model: str) -> bool:
+    normalized = (model or "").strip().lower()
+    return normalized.startswith("gpt-image") or normalized in {"gpt-4o-image"}
+
+
+def _openai_path(url: str) -> str:
+    return urlparse(url).path.rstrip("/")
+
+
+def normalize_provider_url(provider: str, url: str) -> Tuple[str, Optional[str]]:
+    """Return a provider-normalized URL and optional warning message."""
+    if provider != "openai":
+        return url, None
+
+    path = _openai_path(url)
+    if path == "/v1/images":
+        parsed = urlparse(url)
+        normalized = urlunparse(parsed._replace(path="/v1/images/generations"))
+        return (
+            normalized,
+            "OpenAI image generation endpoint '/v1/images' normalized to '/v1/images/generations'.",
+        )
+
+    return url, None
 
 
 def detect_provider(url: str) -> str:
@@ -92,9 +120,11 @@ def get_response_template_name(provider: str, url: str = "") -> str:
     if provider == "gemini":
         return "gemini_generate"
     if provider == "openai":
-        path = urlparse(url).path.rstrip("/")
+        path = _openai_path(url)
         if path == "/v1/responses":
             return "openai_responses"
+        if path in ("/v1/images", "/v1/images/generations"):
+            return "openai_images"
         return "openai_chat"
     return "openai_responses"
 
@@ -104,12 +134,12 @@ def requires_post(provider: str, url: str) -> bool:
     if provider in ("anthropic", "xai", "gemini"):
         return True
     if provider == "openai":
-        path = urlparse(url).path.rstrip("/")
-        return path in ("/v1/responses", "/v1/chat/completions")
+        path = _openai_path(url)
+        return path in ("/v1/responses", "/v1/chat/completions", "/v1/images", "/v1/images/generations")
     return False
 
 
-def get_default_payload(provider: str, prompt_text: str = "Hello from LLMind") -> Dict[str, Any]:
+def get_default_payload(provider: str, prompt_text: str = "Hello from LLMind", url: str = "") -> Dict[str, Any]:
     """Return a minimal default JSON payload for *provider*."""
     if provider == "anthropic":
         return {
@@ -124,6 +154,12 @@ def get_default_payload(provider: str, prompt_text: str = "Hello from LLMind") -
         }
     if provider == "gemini":
         return {"contents": [{"parts": [{"text": prompt_text}]}]}
+    if provider == "openai" and _openai_path(url) == "/v1/images/generations":
+        return {
+            "model": "gpt-image-1",
+            "prompt": prompt_text,
+        }
+
     # openai (responses endpoint)
     return {
         "model": DEFAULT_MODELS["openai"],
@@ -141,8 +177,8 @@ def build_payload_from_user_input(
 ) -> Dict[str, Any]:
     """Build a provider-appropriate JSON payload from interactive user input.
 
-    Pass ``provider="openai_chat"`` to use the OpenAI Chat Completions request
-    format (shared with xAI) even when the host is ``api.openai.com``.
+    Pass ``provider="openai_chat"`` for OpenAI Chat Completions format and
+    ``provider="openai_images"`` for OpenAI Images format.
     """
     if provider == "anthropic":
         payload: Dict[str, Any] = {
@@ -181,8 +217,28 @@ def build_payload_from_user_input(
             payload["generationConfig"] = generation_config
         return payload
 
+    if provider == "openai_images":
+        effective_prompt = prompt_text
+        if system_instructions:
+            effective_prompt = f"{system_instructions}\n\n{prompt_text}"
+        return {
+            "model": model,
+            "prompt": effective_prompt,
+        }
+
     # openai responses endpoint
-    payload = {"model": model, "input": prompt_text}
+    payload: Dict[str, Any] = {"model": model}
+    if _is_openai_image_model(model):
+        # Image models expect multimodal input content blocks rather than
+        # tool invocation with plain string input.
+        payload["input"] = [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt_text}],
+            }
+        ]
+    else:
+        payload["input"] = prompt_text
     if system_instructions:
         payload["instructions"] = system_instructions
     if temperature is not None:
@@ -190,3 +246,142 @@ def build_payload_from_user_input(
     if max_tokens is not None:
         payload["max_output_tokens"] = max_tokens
     return payload
+
+
+def fetch_openai_models(api_key: str) -> List[str]:
+    """Return a sorted list of model IDs available under *api_key*.
+
+    Calls ``GET https://api.openai.com/v1/models`` with the supplied key.
+    Returns an empty list on any network or authentication failure so callers
+    can gracefully fall back to the static default.
+    """
+    url = "https://api.openai.com/v1/models"
+    auth_headers = {"Authorization": f"Bearer {api_key}"}
+
+    # Prefer the ``requests`` library if available.
+    try:
+        import requests as _req  # type: ignore
+        resp = _req.get(url, headers=auth_headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return sorted(
+                m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m
+            )
+        return []
+    except Exception:
+        pass
+
+    # Fallback: stdlib urllib
+    try:
+        req = _urllib_request.Request(url, headers=auth_headers)
+        with _urllib_request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read())
+            return sorted(
+                m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m
+            )
+    except Exception:
+        return []
+
+
+def fetch_anthropic_models(api_key: str) -> List[str]:
+    """Return a sorted list of Anthropic model IDs available under *api_key*.
+
+    Calls ``GET https://api.anthropic.com/v1/models`` with the supplied key.
+    Returns an empty list on any failure.
+    """
+    url = "https://api.anthropic.com/v1/models"
+    auth_headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+
+    try:
+        import requests as _req  # type: ignore
+        resp = _req.get(url, headers=auth_headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return sorted(
+                m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m
+            )
+        return []
+    except Exception:
+        pass
+
+    try:
+        req = _urllib_request.Request(url, headers=auth_headers)
+        with _urllib_request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read())
+            return sorted(
+                m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m
+            )
+    except Exception:
+        return []
+
+
+def fetch_xai_models(api_key: str) -> List[str]:
+    """Return a sorted list of xAI model IDs available under *api_key*.
+
+    Calls ``GET https://api.x.ai/v1/models`` (OpenAI-compatible format).
+    Returns an empty list on any failure.
+    """
+    url = "https://api.x.ai/v1/models"
+    auth_headers = {"Authorization": f"Bearer {api_key}"}
+
+    try:
+        import requests as _req  # type: ignore
+        resp = _req.get(url, headers=auth_headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return sorted(
+                m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m
+            )
+        return []
+    except Exception:
+        pass
+
+    try:
+        req = _urllib_request.Request(url, headers=auth_headers)
+        with _urllib_request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read())
+            return sorted(
+                m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m
+            )
+    except Exception:
+        return []
+
+
+def fetch_gemini_models(api_key: str) -> List[str]:
+    """Return a sorted list of Gemini model IDs available under *api_key*.
+
+    Calls ``GET https://generativelanguage.googleapis.com/v1beta/models?key=<api_key>``.
+    Returns an empty list on any failure.
+    """
+    base_url = "https://generativelanguage.googleapis.com/v1beta/models"
+    url = f"{base_url}?key={api_key}"
+
+    try:
+        import requests as _req  # type: ignore
+        resp = _req.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            # Each entry has a "name" like "models/gemini-2.0-flash"; strip the prefix.
+            return sorted(
+                m["name"].removeprefix("models/")
+                for m in data.get("models", [])
+                if isinstance(m, dict) and "name" in m
+            )
+        return []
+    except Exception:
+        pass
+
+    try:
+        req = _urllib_request.Request(url)
+        with _urllib_request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read())
+            return sorted(
+                m["name"].removeprefix("models/")
+                for m in data.get("models", [])
+                if isinstance(m, dict) and "name" in m
+            )
+    except Exception:
+        return []

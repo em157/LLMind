@@ -6,11 +6,14 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from appdata.data_writer import DataWriter
 from cache.cache_mgr import CacheManager
 from main.LLMind import LLMindCLI
+from hooks.hook_registry import HookRegistry, HookResult
+from hooks.provider_adapters import render_provider_tools, render_openai_tools
 import network.requests as network_requests
 from network.providers import (
     build_payload_from_user_input,
@@ -19,6 +22,7 @@ from network.providers import (
     get_default_payload,
     get_response_template_name,
     inject_api_key_into_url,
+    normalize_provider_url,
     requires_post,
 )
 from response.response_handler import (
@@ -28,6 +32,11 @@ from response.response_handler import (
     get_download_filename,
     is_downloadable_response,
     parameterize_json_response,
+)
+from response.model_hook_processor import (
+    extract_hook_calls_from_response,
+    get_model_capability_table,
+    process_model_response_with_hooks,
 )
 from utils.utilities import normalize_response_params, parse_json_text, resolve_param_path
 
@@ -244,6 +253,35 @@ class ResponseHandlerTests(unittest.TestCase):
         self.assertEqual(candidates[0]["mime"], "image/png")
         self.assertEqual(candidates[0]["content"], png_bytes)
 
+    def test_extract_file_artifact_candidates_from_openai_images_b64_json(self) -> None:
+        png_bytes = b"\x89PNG\r\n\x1a\n"
+        payload = {
+            "data": [
+                {
+                    "b64_json": "iVBORw0KGgo=",
+                }
+            ]
+        }
+        candidates = list(extract_file_artifact_candidates(payload))
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["filename"], "image_generation_1.png")
+        self.assertEqual(candidates[0]["mime"], "image/png")
+        self.assertEqual(candidates[0]["content"], png_bytes)
+
+    def test_extract_file_artifact_candidates_from_openai_images_url(self) -> None:
+        payload = {
+            "data": [
+                {
+                    "url": "https://example.test/images/generated_star.png",
+                }
+            ]
+        }
+        candidates = list(extract_file_artifact_candidates(payload))
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["filename"], "generated_star.png")
+        self.assertTrue(candidates[0]["remote_fetch"])
+        self.assertIsNone(candidates[0]["content"])
+
     def test_extract_file_artifact_candidate_remote_image_link(self) -> None:
         text = "Generated image: [output.png](https://example.test/generated/output.png)"
         candidates = list(extract_file_artifact_candidates_from_text(text))
@@ -274,6 +312,80 @@ class ResponseHandlerTests(unittest.TestCase):
 
 
 class NetworkDownloadTests(unittest.TestCase):
+    def test_perform_api_request_returns_http_error_for_requests_4xx(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+
+        class FakeResponse:
+            status_code = 400
+            reason = "Bad Request"
+            headers = {"Content-Type": "application/json"}
+            content = b'{"error":{"message":"Missing required parameter: prompt"}}'
+            text = '{"error":{"message":"Missing required parameter: prompt"}}'
+
+        class FakeRequests:
+            @staticmethod
+            def request(*_args, **_kwargs):
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            writer = DataWriter()
+            CacheManager(writer).save_api_key("sk_test_key_for_http_error")
+
+            try:
+                with patch("network.requests._requests", FakeRequests):
+                    status, body = network_requests.perform_api_request(
+                        "https://api.openai.com/v1/responses",
+                        method="POST",
+                        json_payload={"model": "gpt-4.1-mini", "input": "hello"},
+                    )
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        self.assertEqual(status, 400)
+        self.assertIn("http-error: HTTP 400 Bad Request", body)
+        self.assertIn("Missing required parameter", body)
+
+    def test_openai_images_request_uses_extended_timeout(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+        captured_timeout = {"value": None}
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"Content-Type": "application/json"}
+            content = b'{"data":[]}'
+            text = '{"data":[]}'
+
+        class FakeRequests:
+            @staticmethod
+            def request(*_args, **kwargs):
+                captured_timeout["value"] = kwargs.get("timeout")
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            writer = DataWriter()
+            CacheManager(writer).save_api_key("sk_test_key_for_timeout")
+
+            try:
+                with patch("network.requests._requests", FakeRequests):
+                    status, _ = network_requests.perform_api_request(
+                        "https://api.openai.com/v1/images/generations",
+                        method="POST",
+                        json_payload={"model": "gpt-image-1", "prompt": "make stars"},
+                    )
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        self.assertEqual(status, 200)
+        self.assertEqual(captured_timeout["value"], 120)
+
     def test_perform_api_request_saves_downloadable_response_artifact(self) -> None:
         original_appdata = os.environ.get("APPDATA")
 
@@ -638,6 +750,120 @@ class LoggingTests(unittest.TestCase):
         self.assertTrue(any("AppData directory resolved to:" in message for message in cli.progress.infos))
 
 
+class WindowsHookValidationTests(unittest.TestCase):
+    def test_filesystem_hook_validation_success(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            cli = LLMindCLI()
+            ok, message = cli._validate_filesystem_hook()
+
+        if original_appdata is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = original_appdata
+
+        self.assertTrue(ok)
+        self.assertIn("Read/write validated", message)
+
+    def test_registry_hook_validation_non_windows(self) -> None:
+        cli = LLMindCLI()
+        with patch("hooks.hook_registry.os.name", "posix"):
+            ok, message = cli._validate_registry_hook()
+        self.assertFalse(ok)
+        self.assertIn("only available on Windows", message)
+
+    def test_run_windows_hook_self_test_logs_status(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            cli = LLMindCLI()
+            cli.progress = SpyProgress()
+            with patch.object(
+                cli.hook_registry,
+                "execute_many",
+                return_value=[
+                    HookResult("filesystem_access", True, "simulated fs ok"),
+                    HookResult("registry_settings", False, "simulated registry unavailable"),
+                ],
+            ):
+                cli.run_windows_hook_self_test()
+
+        if original_appdata is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = original_appdata
+
+        self.assertIn("Filesystem Hook Success: simulated fs ok", cli.progress.oks)
+        self.assertIn("Registry Hook Failure: simulated registry unavailable", cli.progress.errors)
+
+
+class HookRegistryTests(unittest.TestCase):
+    def test_execute_unknown_hook_returns_validation_error(self) -> None:
+        registry = HookRegistry(app_name="LLMind")
+        registry.register_builtin_hooks()
+        ctx = registry.build_context(Path("."))
+        result = registry.execute("does_not_exist", ctx)
+        self.assertFalse(result.success)
+        self.assertIn("Unknown hook", result.message)
+
+    def test_generate_persistent_hook_module_validates_and_writes_file(self) -> None:
+        registry = HookRegistry(app_name="LLMind")
+        registry.register_builtin_hooks()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "persistent_hooks.py"
+            generated = registry.generate_persistent_hook_module(
+                ["filesystem_access", "registry_settings"],
+                output_file,
+            )
+
+            self.assertEqual(generated, output_file)
+            self.assertTrue(output_file.exists())
+            content = output_file.read_text(encoding="utf-8")
+            self.assertIn("def build_registry", content)
+            self.assertIn("FileSystemAccessHook", content)
+            self.assertIn("RegistrySettingsHook", content)
+
+    def test_generate_persistent_hook_module_rejects_unknown_hook(self) -> None:
+        registry = HookRegistry(app_name="LLMind")
+        registry.register_builtin_hooks()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "persistent_hooks.py"
+            with self.assertRaises(ValueError):
+                registry.generate_persistent_hook_module(["bogus_hook"], output_file)
+
+
+class ProviderAdapterTests(unittest.TestCase):
+    def test_openai_adapter_renders_function_tools(self) -> None:
+        tools = render_openai_tools()
+        self.assertTrue(tools)
+        first = tools[0]
+        self.assertEqual(first.get("type"), "function")
+        self.assertIn("function", first)
+
+    def test_provider_adapter_routes_openai_style(self) -> None:
+        rendered = render_provider_tools("openai")
+        self.assertIn("tools", rendered)
+        self.assertTrue(rendered["tools"])
+        self.assertEqual(rendered.get("tool_choice"), "auto")
+
+    def test_provider_adapter_routes_anthropic_tools(self) -> None:
+        rendered = render_provider_tools("anthropic")
+        self.assertIn("tools", rendered)
+        self.assertTrue(rendered["tools"])
+        self.assertIn("input_schema", rendered["tools"][0])
+
+    def test_provider_adapter_routes_gemini_tools(self) -> None:
+        rendered = render_provider_tools("gemini")
+        self.assertIn("tools", rendered)
+        self.assertTrue(rendered["tools"])
+        self.assertIn("function_declarations", rendered["tools"][0])
+
+
 class ProviderDetectionTests(unittest.TestCase):
     def test_detects_openai(self) -> None:
         self.assertEqual(detect_provider("https://api.openai.com/v1/responses"), "openai")
@@ -672,6 +898,18 @@ class ProviderDetectionTests(unittest.TestCase):
             "openai_chat",
         )
 
+    def test_openai_images_template(self) -> None:
+        self.assertEqual(
+            get_response_template_name("openai", "https://api.openai.com/v1/images/generations"),
+            "openai_images",
+        )
+
+    def test_openai_images_template_base_path(self) -> None:
+        self.assertEqual(
+            get_response_template_name("openai", "https://api.openai.com/v1/images"),
+            "openai_images",
+        )
+
     def test_anthropic_template(self) -> None:
         self.assertEqual(get_response_template_name("anthropic"), "anthropic_messages")
 
@@ -697,6 +935,10 @@ class ProviderDetectionTests(unittest.TestCase):
 
     def test_requires_post_openai_responses(self) -> None:
         self.assertTrue(requires_post("openai", "https://api.openai.com/v1/responses"))
+
+    def test_requires_post_openai_images(self) -> None:
+        self.assertTrue(requires_post("openai", "https://api.openai.com/v1/images"))
+        self.assertTrue(requires_post("openai", "https://api.openai.com/v1/images/generations"))
 
     def test_generic_does_not_require_post(self) -> None:
         self.assertFalse(requires_post("generic", "https://httpbin.org/get"))
@@ -734,12 +976,28 @@ class ProviderHeaderTests(unittest.TestCase):
         result = inject_api_key_into_url(url, "openai", "sk-key")
         self.assertEqual(result, url)
 
+    def test_normalize_openai_images_url(self) -> None:
+        normalized, warning = normalize_provider_url("openai", "https://api.openai.com/v1/images")
+        self.assertEqual(normalized, "https://api.openai.com/v1/images/generations")
+        self.assertIsNotNone(warning)
+
+    def test_normalize_non_images_url_unchanged(self) -> None:
+        url = "https://api.openai.com/v1/responses"
+        normalized, warning = normalize_provider_url("openai", url)
+        self.assertEqual(normalized, url)
+        self.assertIsNone(warning)
+
 
 class ProviderPayloadTests(unittest.TestCase):
     def test_openai_default_payload(self) -> None:
         payload = get_default_payload("openai")
         self.assertIn("model", payload)
         self.assertIn("input", payload)
+
+    def test_openai_images_default_payload(self) -> None:
+        payload = get_default_payload("openai", url="https://api.openai.com/v1/images/generations")
+        self.assertEqual(payload["model"], "gpt-image-1")
+        self.assertIn("prompt", payload)
 
     def test_anthropic_default_payload_has_messages(self) -> None:
         payload = get_default_payload("anthropic")
@@ -790,6 +1048,30 @@ class ProviderPayloadTests(unittest.TestCase):
         self.assertEqual(payload["input"], "Hello")
         self.assertEqual(payload["instructions"], "You are helpful.")
         self.assertEqual(payload["max_output_tokens"], 512)
+
+    def test_build_openai_image_responses_payload_uses_multimodal_input(self) -> None:
+        payload = build_payload_from_user_input(
+            "openai",
+            "gpt-image-2",
+            "Create a temple of happiness with tall arches and a mysterious location.",
+        )
+        self.assertEqual(payload["model"], "gpt-image-2")
+        self.assertEqual(payload["input"][0]["role"], "user")
+        self.assertEqual(
+            payload["input"][0]["content"][0]["text"],
+            "Create a temple of happiness with tall arches and a mysterious location.",
+        )
+
+    def test_build_openai_images_payload(self) -> None:
+        payload = build_payload_from_user_input(
+            "openai_images",
+            "gpt-image-1",
+            "Make a star pattern",
+            system_instructions="High contrast",
+        )
+        self.assertEqual(payload["model"], "gpt-image-1")
+        self.assertIn("High contrast", payload["prompt"])
+        self.assertIn("Make a star pattern", payload["prompt"])
 
 
 class AnthropicRequestTests(unittest.TestCase):
@@ -848,6 +1130,9 @@ class AnthropicRequestTests(unittest.TestCase):
         self.assertEqual(payload["response_params"]["message_text"], "Hello from Claude!")
         self.assertEqual(payload["response_params"]["stop_reason"], "end_turn")
         self.assertEqual(payload["response_params"]["input_tokens"], 10)
+        self.assertIn("hook_processing", payload)
+        self.assertEqual(payload["hook_processing"]["provider"], "anthropic")
+        self.assertIn("validated_hook_calls", payload["hook_processing"])
 
 
 class XAIRequestTests(unittest.TestCase):
@@ -909,6 +1194,9 @@ class XAIRequestTests(unittest.TestCase):
         self.assertEqual(payload["response_params"]["message_text"], "Hello from Grok!")
         self.assertEqual(payload["response_params"]["finish_reason"], "stop")
         self.assertEqual(payload["response_params"]["total_tokens"], 9)
+        self.assertIn("hook_processing", payload)
+        self.assertEqual(payload["hook_processing"]["provider"], "xai")
+        self.assertIn("validated_hook_calls", payload["hook_processing"])
 
 
 class GeminiRequestTests(unittest.TestCase):
@@ -970,6 +1258,9 @@ class GeminiRequestTests(unittest.TestCase):
         self.assertEqual(payload["response_params"]["message_text"], "Hello from Gemini!")
         self.assertEqual(payload["response_params"]["finish_reason"], "STOP")
         self.assertEqual(payload["response_params"]["total_tokens"], 7)
+        self.assertIn("hook_processing", payload)
+        self.assertEqual(payload["hook_processing"]["provider"], "gemini")
+        self.assertIn("validated_hook_calls", payload["hook_processing"])
 
     def test_gemini_key_injected_before_request(self) -> None:
         """Verify the Gemini API key is appended to the URL as ?key=."""
@@ -1008,6 +1299,112 @@ class GeminiRequestTests(unittest.TestCase):
 
         self.assertEqual(len(captured_urls), 1)
         self.assertIn("key=gm-test-key-url-inject", captured_urls[0])
+
+
+class ModelHookProcessorTests(unittest.TestCase):
+    def test_capability_table_contains_expected_providers(self) -> None:
+        providers = {row["provider"] for row in get_model_capability_table()}
+        self.assertIn("OpenAI", providers)
+        self.assertIn("Anthropic", providers)
+        self.assertIn("Google Gemini", providers)
+        self.assertIn("xAI", providers)
+
+    def test_extract_openai_tool_call(self) -> None:
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "filesystem_access",
+                                    "arguments": "{}",
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        calls, warnings = extract_hook_calls_from_response(payload, provider="openai")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["hook_name"], "filesystem_access")
+        self.assertEqual(calls[0]["args"], {})
+        self.assertEqual(warnings, [])
+
+    def test_extract_anthropic_tool_use(self) -> None:
+        payload = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "filesystem_access",
+                    "input": {"reason": "healthcheck"},
+                }
+            ]
+        }
+        calls, _warnings = extract_hook_calls_from_response(payload, provider="anthropic")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["hook_name"], "filesystem_access")
+        self.assertEqual(calls[0]["args"]["reason"], "healthcheck")
+
+    def test_extract_gemini_function_call(self) -> None:
+        payload = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "filesystem_access",
+                                    "args": {},
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        calls, _warnings = extract_hook_calls_from_response(payload, provider="gemini")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["hook_name"], "filesystem_access")
+
+    def test_process_model_response_validates_unknown_hook(self) -> None:
+        registry = HookRegistry()
+        registry.register_builtin_hooks()
+        payload = {
+            "hook_calls": [
+                {"hook": "not_a_real_hook", "args": {}},
+            ]
+        }
+        result = process_model_response_with_hooks(
+            payload=payload,
+            provider="openai",
+            registry=registry,
+            app_data_dir=Path("."),
+            execute=False,
+        )
+        self.assertEqual(len(result["validated_hook_calls"]), 0)
+        self.assertTrue(any("Unknown hook" in item for item in result["validation_errors"]))
+
+    def test_process_model_response_executes_valid_hook(self) -> None:
+        registry = HookRegistry()
+        registry.register_builtin_hooks()
+        payload = {
+            "hook_calls": [
+                {"hook": "filesystem_access", "args": {}},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = process_model_response_with_hooks(
+                payload=payload,
+                provider="openai",
+                registry=registry,
+                app_data_dir=Path(tmpdir),
+                execute=True,
+            )
+        self.assertEqual(len(result["validated_hook_calls"]), 1)
+        self.assertEqual(len(result["hook_results"]), 1)
+        self.assertTrue(result["hook_results"][0]["success"])
 
 
 if __name__ == "__main__":
