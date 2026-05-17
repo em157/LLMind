@@ -133,6 +133,18 @@ class ResponseHandlerTests(unittest.TestCase):
         headers = {"Content-Disposition": 'attachment; filename="../nested/evil.txt"'}
         self.assertEqual(get_download_filename(headers), "evil.txt")
 
+    def test_download_filename_uses_content_type_extension_without_disposition(self) -> None:
+        headers = {"Content-Type": "image/png"}
+        self.assertEqual(get_download_filename(headers), "artifact.png")
+
+    def test_downloadable_response_detects_binary_content_type(self) -> None:
+        headers = {"Content-Type": "image/png"}
+        self.assertTrue(is_downloadable_response(headers))
+
+    def test_downloadable_response_rejects_json_without_disposition(self) -> None:
+        headers = {"Content-Type": "application/json"}
+        self.assertFalse(is_downloadable_response(headers))
+
     def test_extract_file_artifact_candidate_from_sandbox_link(self) -> None:
         text = (
             'Here is the file:\n\n```\nAi for humanity\n```\n\n'
@@ -215,6 +227,50 @@ class ResponseHandlerTests(unittest.TestCase):
             candidates[0]["content"],
             b"# Title\n\n- one\n- two",
         )
+
+    def test_extract_file_artifact_candidates_from_openai_image_generation_output(self) -> None:
+        png_bytes = b"\x89PNG\r\n\x1a\n"
+        payload = {
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "result": "iVBORw0KGgo=",
+                }
+            ]
+        }
+        candidates = list(extract_file_artifact_candidates(payload))
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["filename"], "image_generation_1.png")
+        self.assertEqual(candidates[0]["mime"], "image/png")
+        self.assertEqual(candidates[0]["content"], png_bytes)
+
+    def test_extract_file_artifact_candidate_remote_image_link(self) -> None:
+        text = "Generated image: [output.png](https://example.test/generated/output.png)"
+        candidates = list(extract_file_artifact_candidates_from_text(text))
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["filename"], "output.png")
+        self.assertTrue(candidates[0]["remote_fetch"])
+        self.assertIsNone(candidates[0]["content"])
+
+    def test_extract_file_artifact_candidate_from_plain_text_with_file_cue(self) -> None:
+        text = (
+            "Please save this file as `essay.txt`. "
+            "This is a long essay body that should be persisted as an artifact when explicit "
+            "file intent is present in the response text so users can download it locally."
+        )
+        candidates = list(extract_file_artifact_candidates_from_text(text))
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["filename"], "essay.txt")
+        self.assertEqual(candidates[0]["mime"], "text/plain")
+        self.assertIn(b"Please save this file", candidates[0]["content"])
+
+    def test_extract_file_artifact_candidate_plain_text_without_file_cue_is_skipped(self) -> None:
+        text = (
+            "This response is intentionally long but does not include an explicit persistence instruction and "
+            "should remain ordinary assistant text rather than being written as an artifact candidate."
+        )
+        candidates = list(extract_file_artifact_candidates_from_text(text))
+        self.assertEqual(candidates, [])
 
 
 class NetworkDownloadTests(unittest.TestCase):
@@ -328,6 +384,181 @@ class NetworkDownloadTests(unittest.TestCase):
                 self.assertEqual(handle.read(), b"Ai for humanity")
             records = CacheManager(writer).load_artifact_records()
             self.assertEqual(records[-1]["id"], artifact["id"])
+
+    def test_perform_api_request_saves_binary_response_without_disposition(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+
+        class FakeResponse:
+            status_code = 200
+            headers = {
+                "Content-Type": "image/png",
+                "Content-Length": "8",
+            }
+            content = b"\x89PNG\r\n\x1a\n"
+            text = ""
+
+        class FakeRequests:
+            @staticmethod
+            def get(*_args, **_kwargs):
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            writer = DataWriter()
+            CacheManager(writer).save_api_key("sk_test_key_for_binary_download")
+
+            try:
+                with patch("network.requests._requests", FakeRequests):
+                    status, body = network_requests.perform_api_request("https://example.test/image")
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+            self.assertEqual(status, 200)
+            payload = json.loads(body)
+            artifact = payload["artifact"]
+            self.assertEqual(artifact["filename"], "artifact.png")
+            self.assertEqual(artifact["mime"], "image/png")
+            self.assertTrue(os.path.exists(artifact["path"]))
+            with open(artifact["path"], "rb") as handle:
+                self.assertEqual(handle.read(), b"\x89PNG\r\n\x1a\n")
+
+    def test_perform_openai_request_fetches_remote_image_artifact(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+        response_body = {
+            "id": "resp_remote_123",
+            "model": "gpt-4.1-mini",
+            "status": "completed",
+            "output": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Generated image: [render.png](https://example.test/files/render.png)",
+                        }
+                    ],
+                }
+            ],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            },
+        }
+
+        class FakeRequestResponse:
+            status_code = 200
+            headers = {"Content-Type": "application/json"}
+            content = json.dumps(response_body).encode("utf-8")
+            text = json.dumps(response_body)
+
+        class FakeImageResponse:
+            status_code = 200
+            headers = {
+                "Content-Type": "image/png",
+                "Content-Disposition": 'attachment; filename="rendered.png"',
+            }
+            content = b"\x89PNG\r\n\x1a\n"
+
+        class FakeRequests:
+            @staticmethod
+            def request(*_args, **_kwargs):
+                return FakeRequestResponse()
+
+            @staticmethod
+            def get(*_args, **_kwargs):
+                return FakeImageResponse()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            writer = DataWriter()
+            CacheManager(writer).save_api_key("sk_test_key_for_remote_image")
+
+            try:
+                with patch("network.requests._requests", FakeRequests):
+                    status, body = network_requests.perform_api_request(
+                        "https://api.openai.com/v1/responses",
+                        method="POST",
+                        json_payload={"model": "gpt-4.1-mini", "input": "make an image"},
+                    )
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+            self.assertEqual(status, 200)
+            payload = json.loads(body)
+            artifact = payload["artifacts"][0]
+            self.assertEqual(artifact["filename"], "rendered.png")
+            self.assertEqual(artifact["mime"], "image/png")
+            self.assertEqual(artifact["source_url"], "https://example.test/files/render.png")
+            self.assertTrue(os.path.exists(artifact["path"]))
+
+    def test_perform_openai_request_saves_base64_image_generation_artifact(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+        response_body = {
+            "id": "resp_img_123",
+            "model": "gpt-4.1-mini",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "result": "iVBORw0KGgo=",
+                }
+            ],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            },
+        }
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"Content-Type": "application/json"}
+            content = json.dumps(response_body).encode("utf-8")
+            text = json.dumps(response_body)
+
+        class FakeRequests:
+            @staticmethod
+            def request(*_args, **_kwargs):
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            writer = DataWriter()
+            CacheManager(writer).save_api_key("sk_test_key_for_openai_image_generation")
+
+            try:
+                with patch("network.requests._requests", FakeRequests):
+                    status, body = network_requests.perform_api_request(
+                        "https://api.openai.com/v1/responses",
+                        method="POST",
+                        json_payload={
+                            "model": "gpt-4.1-mini",
+                            "input": "Generate an image",
+                            "tools": [{"type": "image_generation"}],
+                        },
+                    )
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+            self.assertEqual(status, 200)
+            payload = json.loads(body)
+            self.assertIn("artifacts", payload)
+            artifact = payload["artifacts"][0]
+            self.assertEqual(artifact["filename"], "image_generation_1.png")
+            self.assertEqual(artifact["mime"], "image/png")
+            self.assertTrue(os.path.exists(artifact["path"]))
+            with open(artifact["path"], "rb") as handle:
+                self.assertEqual(handle.read(), b"\x89PNG\r\n\x1a\n")
 
 
 class LoggingTests(unittest.TestCase):

@@ -31,6 +31,66 @@ from response.response_handler import (
 )
 
 
+MAX_REMOTE_ARTIFACT_BYTES = 10 * 1024 * 1024
+
+
+def _fetch_remote_artifact(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    source_url = candidate.get("source_url")
+    if not isinstance(source_url, str) or not source_url.strip():
+        return None
+
+    fallback_filename = str(candidate.get("filename") or "artifact.bin")
+
+    if _requests is not None:
+        try:
+            response = _requests.get(source_url, timeout=10)
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if status_code >= 400:
+                return None
+            content = getattr(response, "content", b"")
+            if not isinstance(content, bytes) or not content:
+                return None
+            if len(content) > MAX_REMOTE_ARTIFACT_BYTES:
+                return None
+            headers = getattr(response, "headers", {})
+            normalized = normalize_headers(headers)
+            filename = get_download_filename(headers, default=fallback_filename)
+            mime = normalized.get("content-type", "").split(";", 1)[0].strip() or str(
+                candidate.get("mime") or "application/octet-stream"
+            )
+            return {
+                "filename": filename,
+                "mime": mime,
+                "content": content,
+                "source_url": source_url,
+            }
+        except Exception:
+            return None
+
+    try:
+        from urllib import request as _request
+
+        req = _request.Request(source_url, method="GET")
+        with _request.urlopen(req, timeout=10) as response:
+            content = response.read(MAX_REMOTE_ARTIFACT_BYTES + 1)
+            if not content or len(content) > MAX_REMOTE_ARTIFACT_BYTES:
+                return None
+            headers = dict(response.headers.items())
+            normalized = normalize_headers(headers)
+            filename = get_download_filename(headers, default=fallback_filename)
+            mime = normalized.get("content-type", "").split(";", 1)[0].strip() or str(
+                candidate.get("mime") or "application/octet-stream"
+            )
+            return {
+                "filename": filename,
+                "mime": mime,
+                "content": content,
+                "source_url": source_url,
+            }
+    except Exception:
+        return None
+
+
 def _store_downloadable_response(
     status_code: int,
     body: bytes,
@@ -98,17 +158,24 @@ def _format_llm_response_with_artifacts(
     saved_artifacts = []
     for candidate in extract_file_artifact_candidates(parameterized):
         try:
-            content = candidate.get("content", b"")
+            effective_candidate = candidate
+            if candidate.get("remote_fetch"):
+                fetched_candidate = _fetch_remote_artifact(candidate)
+                if fetched_candidate is None:
+                    continue
+                effective_candidate = fetched_candidate
+
+            content = effective_candidate.get("content", b"")
             if not isinstance(content, bytes) or not content:
                 continue
             saved_artifacts.append(
                 _save_file_artifact(
-                    candidate.get("filename", "artifact.bin"),
+                    effective_candidate.get("filename", "artifact.bin"),
                     content,
-                    candidate.get("mime", "application/octet-stream"),
+                    effective_candidate.get("mime", "application/octet-stream"),
                     writer,
                     cache,
-                    candidate.get("source_url"),
+                    effective_candidate.get("source_url"),
                 )
             )
         except Exception:
