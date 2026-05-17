@@ -38,7 +38,8 @@ from response.response_handler import (
 MAX_REMOTE_ARTIFACT_BYTES = 10 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
 OPENAI_IMAGE_TIMEOUT_SECONDS = 120
-MAX_HOOK_ORCHESTRATION_STEPS = 3
+XAI_CHAT_TIMEOUT_SECONDS = 60
+MAX_HOOK_ORCHESTRATION_STEPS = 10
 
 
 def _format_http_error(status_code: int, reason: Optional[str], body: str = "") -> str:
@@ -55,6 +56,11 @@ def _format_http_error(status_code: int, reason: Optional[str], body: str = "") 
     if len(body_text) > 3000:
         body_text = body_text[:3000] + "... [truncated]"
     return f"{head}: {body_text}"
+
+
+def _is_read_timeout_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "read timed out" in text or "read timeout" in text
 
 
 def _fetch_remote_artifact(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -465,27 +471,39 @@ def perform_api_request(
             json_payload.update(render_provider_tools(provider, response_template=response_template))
 
     is_llm_provider = provider != "generic"
-    timeout_seconds = (
-        OPENAI_IMAGE_TIMEOUT_SECONDS
-        if response_template == "openai_images"
-        else DEFAULT_REQUEST_TIMEOUT_SECONDS
-    )
+    if response_template == "openai_images":
+        timeout_seconds = OPENAI_IMAGE_TIMEOUT_SECONDS
+    elif provider == "xai" and response_template in {"openai_chat", "xai_chat"}:
+        timeout_seconds = XAI_CHAT_TIMEOUT_SECONDS
+    else:
+        timeout_seconds = DEFAULT_REQUEST_TIMEOUT_SECONDS
 
     progress.step(f"Sending {method} request to {request_url}")
 
     # Prefer requests if installed
     if _requests is not None:
         try:
-            if method == "GET":
-                r = _requests.get(request_url, headers=headers, timeout=timeout_seconds)
-            else:
-                r = _requests.request(
-                    method,
-                    request_url,
-                    headers=headers,
-                    json=json_payload,
-                    timeout=timeout_seconds,
-                )
+            should_retry_xai = provider == "xai" and response_template in {"openai_chat", "xai_chat"}
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    if method == "GET":
+                        r = _requests.get(request_url, headers=headers, timeout=timeout_seconds)
+                    else:
+                        r = _requests.request(
+                            method,
+                            request_url,
+                            headers=headers,
+                            json=json_payload,
+                            timeout=timeout_seconds,
+                        )
+                    break
+                except Exception as exc:
+                    if should_retry_xai and attempt == 1 and _is_read_timeout_error(exc):
+                        progress.warn("xAI request read timeout; retrying once")
+                        continue
+                    raise
             if r.status_code >= 400:
                 return r.status_code, _format_http_error(r.status_code, getattr(r, "reason", ""), r.text)
             if is_downloadable_response(r.headers):
@@ -510,7 +528,7 @@ def perform_api_request(
                 )
                 if (
                     execute_hook_calls
-                    and response_template == "openai_chat"
+                    and response_template in {"openai_chat", "xai_chat"}
                     and provider in {"openai", "xai", "deepseek", "mistral"}
                     and isinstance(json_payload, dict)
                 ):

@@ -187,6 +187,55 @@ def get_hook_schemas() -> List[HookSchema]:
             },
             strict=False,
         ),
+        HookSchema(
+            name="read_file",
+            description="Read text file contents from Desktop and AppData directories",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["read"]},
+                    "filepath": {"type": "string", "maxLength": 512},
+                    "max_chars": {"type": "integer", "minimum": 100, "maximum": 50000},
+                    "reason": {"type": "string"},
+                },
+                "required": ["action", "filepath"],
+                "additionalProperties": False,
+            },
+            strict=False,
+        ),
+        HookSchema(
+            name="list_directory",
+            description="List files in a directory on Desktop or AppData",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list"]},
+                    "dirpath": {"type": "string", "maxLength": 512},
+                    "extension": {"type": "string", "maxLength": 10},
+                    "reason": {"type": "string"},
+                },
+                "required": ["action", "dirpath"],
+                "additionalProperties": False,
+            },
+            strict=False,
+        ),
+        HookSchema(
+            name="write_file",
+            description="Write text file contents to Desktop and AppData directories",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["write"]},
+                    "filepath": {"type": "string", "maxLength": 512},
+                    "content": {"type": "string", "maxLength": 100000},
+                    "overwrite": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["action", "filepath", "content"],
+                "additionalProperties": False,
+            },
+            strict=False,
+        ),
     ]
 
 

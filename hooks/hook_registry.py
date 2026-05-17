@@ -1097,6 +1097,9 @@ class OrchestrateWorkflowHook(BaseHook):
         "windows_ui_action",
         "capture_screenshot",
         "system_command",
+        "read_file",
+        "list_directory",
+        "write_file",
     }
 
     def execute(self, context: HookContext) -> HookResult:
@@ -1210,6 +1213,318 @@ class OrchestrateWorkflowHook(BaseHook):
         )
 
 
+class ReadFileHook(BaseHook):
+    name = "read_file"
+    description = "Read text file contents from safe directories"
+
+    _ALLOWED_ACTIONS = {"read"}
+    _SAFE_BASE_DIRS = [
+        Path.home() / "Desktop",
+        Path.home() / "Desktop" / "test_dir",
+        Path.home() / "AppData" / "Roaming" / "LLMind",
+        Path.home() / "AppData" / "Local" / "Temp",
+    ]
+
+    def _is_safe_path(self, filepath: str) -> bool:
+        """Validate that the filepath is within an allowed base directory."""
+        try:
+            file_path = Path(filepath).resolve()
+            for safe_dir in self._SAFE_BASE_DIRS:
+                safe_resolved = safe_dir.resolve()
+                try:
+                    file_path.relative_to(safe_resolved)
+                    return True
+                except ValueError:
+                    continue
+            return False
+        except Exception:
+            return False
+
+    def execute(self, context: HookContext) -> HookResult:
+        args = context.extras.get("hook_args", {})
+        if not isinstance(args, dict):
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="Invalid hook args: expected object/dict",
+            )
+
+        action = str(args.get("action", "")).strip().lower()
+        if action not in self._ALLOWED_ACTIONS:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Unsupported action '{action}'. Allowed: {', '.join(sorted(self._ALLOWED_ACTIONS))}",
+            )
+
+        filepath = str(args.get("filepath", "")).strip()
+        if not filepath:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="filepath is required",
+            )
+
+        if not self._is_safe_path(filepath):
+            safe_dirs = ", ".join(str(d) for d in self._SAFE_BASE_DIRS)
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Access denied. File must be in: {safe_dirs}",
+            )
+
+        file_path = Path(filepath)
+        if not file_path.exists():
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"File not found: {filepath}",
+            )
+
+        if not file_path.is_file():
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Not a file: {filepath}",
+            )
+
+        try:
+            max_chars = args.get("max_chars")
+            if max_chars is None:
+                max_chars = 10000
+            else:
+                max_chars = int(max_chars)
+                if max_chars < 100 or max_chars > 50000:
+                    max_chars = 10000
+
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(max_chars)
+
+            return HookResult(
+                hook_name=self.name,
+                success=True,
+                message=f"Read {len(content)} characters from file",
+                details={
+                    "filepath": str(file_path),
+                    "content": content,
+                    "truncated": len(content) >= max_chars,
+                    "max_chars": max_chars,
+                },
+            )
+        except Exception as exc:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Failed to read file: {exc}",
+            )
+
+
+class ListDirectoryHook(BaseHook):
+    name = "list_directory"
+    description = "List files in a directory"
+
+    _ALLOWED_ACTIONS = {"list"}
+    _SAFE_BASE_DIRS = [
+        Path.home() / "Desktop",
+        Path.home() / "Desktop" / "test_dir",
+        Path.home() / "AppData" / "Roaming" / "LLMind",
+        Path.home() / "AppData" / "Local" / "Temp",
+    ]
+
+    def _is_safe_path(self, dirpath: str) -> bool:
+        """Validate that the dirpath is within an allowed base directory."""
+        try:
+            dir_path = Path(dirpath).resolve()
+            for safe_dir in self._SAFE_BASE_DIRS:
+                safe_resolved = safe_dir.resolve()
+                try:
+                    dir_path.relative_to(safe_resolved)
+                    return True
+                except ValueError:
+                    continue
+            return False
+        except Exception:
+            return False
+
+    def execute(self, context: HookContext) -> HookResult:
+        args = context.extras.get("hook_args", {})
+        if not isinstance(args, dict):
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="Invalid hook args: expected object/dict",
+            )
+
+        action = str(args.get("action", "")).strip().lower()
+        if action not in self._ALLOWED_ACTIONS:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Unsupported action '{action}'. Allowed: {', '.join(sorted(self._ALLOWED_ACTIONS))}",
+            )
+
+        dirpath = str(args.get("dirpath", "")).strip()
+        if not dirpath:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="dirpath is required",
+            )
+
+        if not self._is_safe_path(dirpath):
+            safe_dirs = ", ".join(str(d) for d in self._SAFE_BASE_DIRS)
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Access denied. Directory must be in: {safe_dirs}",
+            )
+
+        dir_path = Path(dirpath)
+        if not dir_path.exists():
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Directory not found: {dirpath}",
+            )
+
+        if not dir_path.is_dir():
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Not a directory: {dirpath}",
+            )
+
+        try:
+            extension = str(args.get("extension", "")).strip().lower()
+            if extension and not extension.startswith("."):
+                extension = f".{extension}"
+
+            files: List[Dict[str, Any]] = []
+            for item in sorted(dir_path.iterdir()):
+                if not item.is_file():
+                    continue
+                if extension and not item.suffix.lower() == extension:
+                    continue
+                files.append(
+                    {
+                        "name": item.name,
+                        "path": str(item),
+                        "size": item.stat().st_size,
+                    }
+                )
+
+            return HookResult(
+                hook_name=self.name,
+                success=True,
+                message=f"Listed {len(files)} file(s)",
+                details={
+                    "dirpath": str(dir_path),
+                    "extension_filter": extension or "(no filter)",
+                    "files": files,
+                },
+            )
+        except Exception as exc:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Failed to list directory: {exc}",
+            )
+
+
+class WriteFileHook(BaseHook):
+    name = "write_file"
+    description = "Write text file contents to safe directories"
+
+    _ALLOWED_ACTIONS = {"write"}
+    _SAFE_BASE_DIRS = [
+        Path.home() / "Desktop",
+        Path.home() / "Desktop" / "test_dir",
+        Path.home() / "AppData" / "Roaming" / "LLMind",
+        Path.home() / "AppData" / "Local" / "Temp",
+    ]
+
+    def _is_safe_path(self, filepath: str) -> bool:
+        """Validate that the filepath is within an allowed base directory."""
+        try:
+            file_path = Path(filepath).resolve()
+            for safe_dir in self._SAFE_BASE_DIRS:
+                safe_resolved = safe_dir.resolve()
+                try:
+                    file_path.relative_to(safe_resolved)
+                    return True
+                except ValueError:
+                    continue
+            return False
+        except Exception:
+            return False
+
+    def execute(self, context: HookContext) -> HookResult:
+        args = context.extras.get("hook_args", {})
+        if not isinstance(args, dict):
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="Invalid hook args: expected object/dict",
+            )
+
+        action = str(args.get("action", "")).strip().lower()
+        if action not in self._ALLOWED_ACTIONS:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Unsupported action '{action}'. Allowed: {', '.join(sorted(self._ALLOWED_ACTIONS))}",
+            )
+
+        filepath = str(args.get("filepath", "")).strip()
+        if not filepath:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="filepath is required",
+            )
+
+        if not self._is_safe_path(filepath):
+            safe_dirs = ", ".join(str(d) for d in self._SAFE_BASE_DIRS)
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Access denied. File must be in: {safe_dirs}",
+            )
+
+        content = str(args.get("content", ""))
+        overwrite = bool(args.get("overwrite", True))
+
+        file_path = Path(filepath)
+        if file_path.exists() and not overwrite:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"File already exists and overwrite=false: {filepath}",
+            )
+
+        try:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            return HookResult(
+                hook_name=self.name,
+                success=True,
+                message=f"Written {len(content)} characters to file",
+                details={
+                    "filepath": str(file_path),
+                    "size": len(content),
+                    "overwrite": overwrite,
+                },
+            )
+        except Exception as exc:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Failed to write file: {exc}",
+            )
+
+
 class HookRegistry:
     """Registry that validates and executes hooks via a shared contract."""
 
@@ -1229,6 +1544,9 @@ class HookRegistry:
         self.register(BrowserNavigationHook())
         self.register(SystemCommandHook())
         self.register(OrchestrateWorkflowHook())
+        self.register(ReadFileHook())
+        self.register(ListDirectoryHook())
+        self.register(WriteFileHook())
 
     def list_hook_names(self) -> List[str]:
         return sorted(self._hooks.keys())
