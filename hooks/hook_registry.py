@@ -460,6 +460,107 @@ class WindowsUIManipulationHook(BaseHook):
         return bool(user32.SetForegroundWindow(wintypes.HWND(hwnd)))
 
 
+class WindowsMetricsHook(BaseHook):
+    name = "windows_metrics"
+    description = "Get Windows 10/11 display metrics including work area"
+
+    _ALLOWED_ACTIONS = {"get_display_metrics"}
+    _SPI_GETWORKAREA = 0x0030
+
+    def execute(self, context: HookContext) -> HookResult:
+        if os.name != "nt":
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="Windows metrics hook is only available on Windows 10/11",
+            )
+
+        if os.getenv("LLMIND_ENABLE_UI_HOOKS", "0").strip() != "1":
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="Windows metrics disabled. Set LLMIND_ENABLE_UI_HOOKS=1 to enable.",
+            )
+
+        args = context.extras.get("hook_args", {})
+        if not isinstance(args, dict):
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="Invalid hook args: expected object/dict",
+            )
+
+        action = str(args.get("action", "")).strip().lower()
+        if action not in self._ALLOWED_ACTIONS:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Unsupported action '{action}'. Allowed: {', '.join(sorted(self._ALLOWED_ACTIONS))}",
+            )
+
+        try:
+            user32 = ctypes.windll.user32
+            primary_width = int(user32.GetSystemMetrics(0))
+            primary_height = int(user32.GetSystemMetrics(1))
+            virtual_x = int(user32.GetSystemMetrics(76))
+            virtual_y = int(user32.GetSystemMetrics(77))
+            virtual_width = int(user32.GetSystemMetrics(78))
+            virtual_height = int(user32.GetSystemMetrics(79))
+
+            work_rect = wintypes.RECT()
+            work_area_ok = bool(
+                user32.SystemParametersInfoW(
+                    self._SPI_GETWORKAREA,
+                    0,
+                    ctypes.byref(work_rect),
+                    0,
+                )
+            )
+
+            dpi = None
+            get_dpi_for_system = getattr(user32, "GetDpiForSystem", None)
+            if callable(get_dpi_for_system):
+                try:
+                    dpi = int(get_dpi_for_system())
+                except Exception:
+                    dpi = None
+
+            work_area = {
+                "x": int(work_rect.left),
+                "y": int(work_rect.top),
+                "width": int(work_rect.right - work_rect.left),
+                "height": int(work_rect.bottom - work_rect.top),
+            }
+
+            return HookResult(
+                hook_name=self.name,
+                success=True,
+                message="Display metrics collected",
+                details={
+                    "action": action,
+                    "primary_screen": {
+                        "width": primary_width,
+                        "height": primary_height,
+                    },
+                    "virtual_screen": {
+                        "x": virtual_x,
+                        "y": virtual_y,
+                        "width": virtual_width,
+                        "height": virtual_height,
+                    },
+                    "work_area": work_area,
+                    "work_area_available": work_area_ok,
+                    "dpi": dpi,
+                },
+            )
+        except Exception as exc:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"{exc.__class__.__name__}: {exc}",
+            )
+
+
 class LaunchProcessHook(BaseHook):
     name = "launch_process"
     description = "Launch allowlisted Windows applications for UI workflows"
@@ -1092,6 +1193,7 @@ class OrchestrateWorkflowHook(BaseHook):
 
     _ALLOWED_ACTIONS = {"run_sequence"}
     _ALLOWED_STEP_HOOKS = {
+        "windows_metrics",
         "launch_process",
         "browser_navigation",
         "windows_ui_action",
@@ -1100,6 +1202,8 @@ class OrchestrateWorkflowHook(BaseHook):
         "read_file",
         "list_directory",
         "write_file",
+        "send_email_smtp",
+        "send_email_outlook",
     }
 
     def execute(self, context: HookContext) -> HookResult:
@@ -1525,6 +1629,266 @@ class WriteFileHook(BaseHook):
             )
 
 
+class SendEmailSMTPHook(BaseHook):
+    name = "send_email_smtp"
+    description = "Send an email via SMTP using credentials from environment variables"
+
+    _ALLOWED_ACTIONS = {"send"}
+    _MAX_RECIPIENTS = 10
+    _MAX_SUBJECT_LENGTH = 256
+    _MAX_BODY_LENGTH = 50000
+    _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+    def execute(self, context: HookContext) -> HookResult:
+        if os.getenv("LLMIND_ENABLE_EMAIL_HOOKS", "0").strip() != "1":
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="Email hooks disabled. Set LLMIND_ENABLE_EMAIL_HOOKS=1 to enable.",
+            )
+
+        args = context.extras.get("hook_args", {})
+        if not isinstance(args, dict):
+            return HookResult(hook_name=self.name, success=False, message="Invalid hook args: expected object/dict")
+
+        action = str(args.get("action", "")).strip().lower()
+        if action not in self._ALLOWED_ACTIONS:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Unsupported action '{action}'. Allowed: send",
+            )
+
+        # Credentials are NEVER accepted from tool args — env vars only.
+        smtp_host = os.getenv("LLMIND_SMTP_HOST", "").strip()
+        smtp_port_raw = os.getenv("LLMIND_SMTP_PORT", "587").strip()
+        smtp_user = os.getenv("LLMIND_SMTP_USER", "").strip()
+        smtp_password = os.getenv("LLMIND_SMTP_PASSWORD", "").strip()
+        smtp_from = os.getenv("LLMIND_SMTP_FROM", smtp_user).strip()
+        use_tls = os.getenv("LLMIND_SMTP_TLS", "1").strip() == "1"
+
+        if not smtp_host:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="SMTP not configured. Set LLMIND_SMTP_HOST (and optionally LLMIND_SMTP_PORT, LLMIND_SMTP_USER, LLMIND_SMTP_PASSWORD, LLMIND_SMTP_FROM).",
+            )
+
+        try:
+            smtp_port = int(smtp_port_raw)
+        except ValueError:
+            smtp_port = 587
+
+        to_raw = str(args.get("to", "")).strip()
+        subject = str(args.get("subject", "")).strip()
+        body = str(args.get("body", "")).strip()
+        cc_raw = str(args.get("cc", "")).strip()
+        bcc_raw = str(args.get("bcc", "")).strip()
+        is_html = bool(args.get("html", False))
+
+        if not to_raw:
+            return HookResult(hook_name=self.name, success=False, message="'to' is required")
+        if not subject:
+            return HookResult(hook_name=self.name, success=False, message="'subject' is required")
+        if not body:
+            return HookResult(hook_name=self.name, success=False, message="'body' is required")
+        if len(subject) > self._MAX_SUBJECT_LENGTH:
+            return HookResult(hook_name=self.name, success=False, message=f"Subject too long (max {self._MAX_SUBJECT_LENGTH})")
+        if len(body) > self._MAX_BODY_LENGTH:
+            return HookResult(hook_name=self.name, success=False, message=f"Body too long (max {self._MAX_BODY_LENGTH})")
+
+        to_list = self._parse_addresses(to_raw)
+        cc_list = self._parse_addresses(cc_raw) if cc_raw else []
+        bcc_list = self._parse_addresses(bcc_raw) if bcc_raw else []
+        all_recipients = to_list + cc_list + bcc_list
+
+        if not to_list:
+            return HookResult(hook_name=self.name, success=False, message="No valid 'to' addresses found")
+        if len(all_recipients) > self._MAX_RECIPIENTS:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Too many recipients (max {self._MAX_RECIPIENTS})",
+            )
+        for addr in all_recipients:
+            if not self._EMAIL_PATTERN.match(addr):
+                return HookResult(hook_name=self.name, success=False, message=f"Invalid email address: {addr}")
+
+        try:
+            import smtplib
+            from email.mime.multipart import MIMEMultipart
+            from email.mime.text import MIMEText
+
+            if is_html:
+                msg: Any = MIMEMultipart("alternative")
+                msg.attach(MIMEText(body, "html", "utf-8"))
+            else:
+                msg = MIMEText(body, "plain", "utf-8")
+
+            msg["Subject"] = subject
+            msg["From"] = smtp_from
+            msg["To"] = ", ".join(to_list)
+            if cc_list:
+                msg["Cc"] = ", ".join(cc_list)
+
+            if use_tls:
+                server = smtplib.SMTP(smtp_host, smtp_port, timeout=15)
+                server.starttls()
+            else:
+                server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15)
+
+            if smtp_user and smtp_password:
+                server.login(smtp_user, smtp_password)
+
+            server.sendmail(smtp_from, all_recipients, msg.as_string())
+            server.quit()
+
+            return HookResult(
+                hook_name=self.name,
+                success=True,
+                message=f"Email sent via SMTP to {len(to_list)} recipient(s)",
+                details={
+                    "action": action,
+                    "to": to_list,
+                    "cc": cc_list,
+                    "bcc": bcc_list,
+                    "subject": subject,
+                    "html": is_html,
+                    "smtp_host": smtp_host,
+                    "smtp_port": smtp_port,
+                },
+            )
+        except Exception as exc:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"{exc.__class__.__name__}: {exc}",
+            )
+
+    def _parse_addresses(self, raw: str) -> List[str]:
+        return [addr.strip() for addr in re.split(r"[,;]", raw) if addr.strip()]
+
+
+class SendEmailOutlookHook(BaseHook):
+    name = "send_email_outlook"
+    description = "Send an email via local Microsoft Outlook COM interface (Windows only)"
+
+    _ALLOWED_ACTIONS = {"send"}
+    _MAX_RECIPIENTS = 10
+    _MAX_SUBJECT_LENGTH = 256
+    _MAX_BODY_LENGTH = 50000
+    _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+    def execute(self, context: HookContext) -> HookResult:
+        if os.name != "nt":
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="send_email_outlook is only available on Windows 10/11",
+            )
+
+        if os.getenv("LLMIND_ENABLE_EMAIL_HOOKS", "0").strip() != "1":
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="Email hooks disabled. Set LLMIND_ENABLE_EMAIL_HOOKS=1 to enable.",
+            )
+
+        args = context.extras.get("hook_args", {})
+        if not isinstance(args, dict):
+            return HookResult(hook_name=self.name, success=False, message="Invalid hook args: expected object/dict")
+
+        action = str(args.get("action", "")).strip().lower()
+        if action not in self._ALLOWED_ACTIONS:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Unsupported action '{action}'. Allowed: send",
+            )
+
+        to_raw = str(args.get("to", "")).strip()
+        subject = str(args.get("subject", "")).strip()
+        body = str(args.get("body", "")).strip()
+        cc_raw = str(args.get("cc", "")).strip()
+        bcc_raw = str(args.get("bcc", "")).strip()
+        is_html = bool(args.get("html", False))
+
+        if not to_raw:
+            return HookResult(hook_name=self.name, success=False, message="'to' is required")
+        if not subject:
+            return HookResult(hook_name=self.name, success=False, message="'subject' is required")
+        if not body:
+            return HookResult(hook_name=self.name, success=False, message="'body' is required")
+        if len(subject) > self._MAX_SUBJECT_LENGTH:
+            return HookResult(hook_name=self.name, success=False, message=f"Subject too long (max {self._MAX_SUBJECT_LENGTH})")
+        if len(body) > self._MAX_BODY_LENGTH:
+            return HookResult(hook_name=self.name, success=False, message=f"Body too long (max {self._MAX_BODY_LENGTH})")
+
+        to_list = self._parse_addresses(to_raw)
+        cc_list = self._parse_addresses(cc_raw) if cc_raw else []
+        bcc_list = self._parse_addresses(bcc_raw) if bcc_raw else []
+        all_recipients = to_list + cc_list + bcc_list
+
+        if not to_list:
+            return HookResult(hook_name=self.name, success=False, message="No valid 'to' addresses found")
+        if len(all_recipients) > self._MAX_RECIPIENTS:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Too many recipients (max {self._MAX_RECIPIENTS})",
+            )
+        for addr in all_recipients:
+            if not self._EMAIL_PATTERN.match(addr):
+                return HookResult(hook_name=self.name, success=False, message=f"Invalid email address: {addr}")
+
+        try:
+            import win32com.client  # type: ignore
+        except ImportError:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message="pywin32 not installed. Run: pip install pywin32",
+            )
+
+        try:
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            mail = outlook.CreateItem(0)  # olMailItem = 0
+            mail.To = "; ".join(to_list)
+            mail.Subject = subject
+            if cc_list:
+                mail.CC = "; ".join(cc_list)
+            if bcc_list:
+                mail.BCC = "; ".join(bcc_list)
+            if is_html:
+                mail.HTMLBody = body
+            else:
+                mail.Body = body
+            mail.Send()
+
+            return HookResult(
+                hook_name=self.name,
+                success=True,
+                message=f"Outlook email sent to {len(to_list)} recipient(s)",
+                details={
+                    "action": action,
+                    "to": to_list,
+                    "cc": cc_list,
+                    "bcc": bcc_list,
+                    "subject": subject,
+                    "html": is_html,
+                },
+            )
+        except Exception as exc:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"{exc.__class__.__name__}: {exc}",
+            )
+
+    def _parse_addresses(self, raw: str) -> List[str]:
+        return [addr.strip() for addr in re.split(r"[,;]", raw) if addr.strip()]
+
+
 class HookRegistry:
     """Registry that validates and executes hooks via a shared contract."""
 
@@ -1539,6 +1903,7 @@ class HookRegistry:
         self.register(FileSystemAccessHook())
         self.register(RegistrySettingsHook())
         self.register(WindowsUIManipulationHook())
+        self.register(WindowsMetricsHook())
         self.register(LaunchProcessHook())
         self.register(CaptureScreenshotHook())
         self.register(BrowserNavigationHook())
@@ -1547,6 +1912,8 @@ class HookRegistry:
         self.register(ReadFileHook())
         self.register(ListDirectoryHook())
         self.register(WriteFileHook())
+        self.register(SendEmailSMTPHook())
+        self.register(SendEmailOutlookHook())
 
     def list_hook_names(self) -> List[str]:
         return sorted(self._hooks.keys())

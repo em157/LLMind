@@ -4,7 +4,7 @@ Centralises all per-provider knowledge: endpoint recognition, authentication
 header construction, default payload shapes, and response template mapping.
 
 Supported providers: ``openai``, ``anthropic``, ``xai``, ``gemini``,
-and ``generic`` (any unrecognised host).
+``deepseek``, ``mistral``, and ``generic`` (any unrecognised host).
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ DEFAULT_MODELS: Dict[str, str] = {
     "anthropic": "claude-opus-4-5",
     "xai": "grok-3",
     "gemini": "gemini-2.0-flash",
+    "deepseek": "deepseek-chat",
+    "mistral": "mistral-large-latest",
 }
 
 
@@ -54,7 +56,8 @@ def detect_provider(url: str) -> str:
     """Return the provider name inferred from *url*.
 
     Returns one of ``"openai"``, ``"anthropic"``, ``"xai"``, ``"gemini"``,
-    or ``"generic"`` when the domain is not recognised.
+    ``"deepseek"``, ``"mistral"``, or ``"generic"`` when the domain is not
+    recognised.
     """
     # Strip port number before matching to avoid false negatives.
     host = urlparse(url).netloc.lower().split(":")[0]
@@ -66,6 +69,10 @@ def detect_provider(url: str) -> str:
         return "xai"
     if host == "generativelanguage.googleapis.com" or host.endswith(".googleapis.com"):
         return "gemini"
+    if host == "api.deepseek.com" or host.endswith(".deepseek.com"):
+        return "deepseek"
+    if host == "api.mistral.ai" or host.endswith(".mistral.ai"):
+        return "mistral"
     return "generic"
 
 
@@ -85,7 +92,7 @@ def build_request_headers(provider: str, api_key: str) -> Dict[str, str]:
         return {"Content-Type": "application/json"}
     if provider == "generic":
         return {"Authorization": f"Bearer {api_key}"}
-    # openai, xai
+    # openai, xai, deepseek, mistral
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -119,6 +126,8 @@ def get_response_template_name(provider: str, url: str = "") -> str:
         return "xai_chat"
     if provider == "gemini":
         return "gemini_generate"
+    if provider in {"deepseek", "mistral"}:
+        return "openai_chat"
     if provider == "openai":
         path = _openai_path(url)
         if path == "/v1/responses":
@@ -131,7 +140,7 @@ def get_response_template_name(provider: str, url: str = "") -> str:
 
 def requires_post(provider: str, url: str) -> bool:
     """Return ``True`` when the endpoint unconditionally requires POST."""
-    if provider in ("anthropic", "xai", "gemini"):
+    if provider in ("anthropic", "xai", "gemini", "deepseek", "mistral"):
         return True
     if provider == "openai":
         path = _openai_path(url)
@@ -150,6 +159,16 @@ def get_default_payload(provider: str, prompt_text: str = "Hello from LLMind", u
     if provider == "xai":
         return {
             "model": DEFAULT_MODELS["xai"],
+            "messages": [{"role": "user", "content": prompt_text}],
+        }
+    if provider == "deepseek":
+        return {
+            "model": DEFAULT_MODELS["deepseek"],
+            "messages": [{"role": "user", "content": prompt_text}],
+        }
+    if provider == "mistral":
+        return {
+            "model": DEFAULT_MODELS["mistral"],
             "messages": [{"role": "user", "content": prompt_text}],
         }
     if provider == "gemini":
@@ -192,7 +211,7 @@ def build_payload_from_user_input(
             payload["temperature"] = temperature
         return payload
 
-    if provider in ("xai", "openai_chat"):
+    if provider in ("xai", "openai_chat", "deepseek", "mistral"):
         messages: list = []
         if system_instructions:
             messages.append({"role": "system", "content": system_instructions})

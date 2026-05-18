@@ -68,6 +68,20 @@ def get_hook_schemas() -> List[HookSchema]:
             strict=False,
         ),
         HookSchema(
+            name="windows_metrics",
+            description="Get Windows 10/11 display metrics including work area and virtual screen",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["get_display_metrics"]},
+                    "reason": {"type": "string"},
+                },
+                "required": ["action"],
+                "additionalProperties": False,
+            },
+            strict=False,
+        ),
+        HookSchema(
             name="launch_process",
             description="Launch allowlisted Windows applications for UI workflows",
             parameters={
@@ -232,6 +246,62 @@ def get_hook_schemas() -> List[HookSchema]:
                     "reason": {"type": "string"},
                 },
                 "required": ["action", "filepath", "content"],
+                "additionalProperties": False,
+            },
+            strict=False,
+        ),
+        HookSchema(
+            name="send_email_smtp",
+            description=(
+                "Send an email via SMTP. Credentials are read from environment variables "
+                "(LLMIND_SMTP_HOST, LLMIND_SMTP_PORT, LLMIND_SMTP_USER, LLMIND_SMTP_PASSWORD, "
+                "LLMIND_SMTP_FROM). Set LLMIND_ENABLE_EMAIL_HOOKS=1 to enable."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["send"]},
+                    "to": {
+                        "type": "string",
+                        "maxLength": 1024,
+                        "description": "Recipient email address(es), comma-separated",
+                    },
+                    "subject": {"type": "string", "maxLength": 256},
+                    "body": {"type": "string", "maxLength": 50000},
+                    "cc": {"type": "string", "maxLength": 1024},
+                    "bcc": {"type": "string", "maxLength": 1024},
+                    "html": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["action", "to", "subject", "body"],
+                "additionalProperties": False,
+            },
+            strict=False,
+        ),
+        HookSchema(
+            name="send_email_outlook",
+            description=(
+                "Send an email via the local Microsoft Outlook COM interface (Windows only). "
+                "Uses the currently signed-in Outlook profile. "
+                "Set LLMIND_ENABLE_EMAIL_HOOKS=1 to enable. Requires pywin32."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["send"]},
+                    "to": {
+                        "type": "string",
+                        "maxLength": 1024,
+                        "description": "Recipient email address(es), comma or semicolon separated",
+                    },
+                    "subject": {"type": "string", "maxLength": 256},
+                    "body": {"type": "string", "maxLength": 50000},
+                    "cc": {"type": "string", "maxLength": 1024},
+                    "bcc": {"type": "string", "maxLength": 1024},
+                    "html": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["action", "to", "subject", "body"],
                 "additionalProperties": False,
             },
             strict=False,
