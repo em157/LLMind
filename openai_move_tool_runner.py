@@ -64,9 +64,10 @@ MODEL = "gpt-4o-mini"  # OpenAI tool-compatible model
 DRY_RUN = False         # Keep True to avoid real file move
 RUN_LLMIND = True      # Set True to launch LLMind.py after model call
 
-SOURCE_FILE = r"C:\Users\Evan\AppData\Roaming\LLMind\test\move.txt"
-DEST_DIR = r"C:\Users\Evan\AppData\Roaming\LLMind"
-LLMIND_ENTRY = r"main\LLMind.py"
+LLMIND_BASE_DIR = Path(os.environ.get("LLMIND_BASE_DIR", str(_resolve_llmind_cache_file().parent)))
+SOURCE_FILE = str(Path(os.environ.get("LLMIND_SOURCE_FILE", str(LLMIND_BASE_DIR / "test" / "move.txt"))))
+DEST_DIR = str(Path(os.environ.get("LLMIND_DEST_DIR", str(LLMIND_BASE_DIR))))
+LLMIND_ENTRY = str(Path("main") / "LLMind.py")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set.")
@@ -76,9 +77,8 @@ tools = render_openai_tools()
 
 # ---------- Prompt ----------
 user_prompt = (
-    'Move the file "move.txt" inside '
-    r'C:\Users\Evan\AppData\Roaming\LLMind\test '
-    r'to C:\Users\Evan\AppData\Roaming\LLMind\ directory.'
+    f'Move the file "move.txt" inside {Path(SOURCE_FILE).parent} '
+    f'to {DEST_DIR} directory.'
 )
 
 # ---------- OpenAI call ----------
