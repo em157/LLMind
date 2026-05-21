@@ -1,3 +1,9 @@
+@echo off
+set "SCRIPT_DIR=%~dp0"
+set "REPO_ROOT=%SCRIPT_DIR%.."
+set "PYTHON_EXE=%PYTHON_EXE%"
+if "%PYTHON_EXE%"=="" set "PYTHON_EXE=python"
+
 (
 echo 2
 echo https://api.x.ai/v1/chat/completions
@@ -9,4 +15,4 @@ echo.
 echo.
 echo.
 echo q
-) | python "C:\Users\Evan\Desktop\LLMind\LLMind\main\LLMind.py"
+) | "%PYTHON_EXE%" "%REPO_ROOT%\main\LLMind.py"

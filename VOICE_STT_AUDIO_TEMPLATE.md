@@ -298,14 +298,14 @@ python audio_cli_template.py --mode local-stt --record-seconds 10 --clip-start 2
 OpenAI transcription:
 
 ```powershell
-$env:OPENAI_API_KEY="your_key_here"
+# Ensure OPENAI_API_KEY is already set in your shell environment.
 python audio_cli_template.py --mode openai-stt --record-seconds 8 --out-dir .\audio_out
 ```
 
 Audio clip to audio-enabled LLM:
 
 ```powershell
-$env:OPENAI_API_KEY="your_key_here"
+# Ensure OPENAI_API_KEY is already set in your shell environment.
 python audio_cli_template.py --mode openai-audio-prompt --openai-model gpt-4o-mini --prompt "Summarize action items" --out-dir .\audio_out
 ```
 
