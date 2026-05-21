@@ -1,4 +1,4 @@
-"""Basic tests for response parameter extraction helpers."""
+﻿"""Basic tests for response parameter extraction helpers."""
 
 from __future__ import annotations
 
@@ -836,6 +836,82 @@ class HookRegistryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 registry.generate_persistent_hook_module(["bogus_hook"], output_file)
 
+    def test_parse_html_content_detects_comment_inputs(self) -> None:
+        registry = HookRegistry(app_name="LLMind")
+        registry.register_builtin_hooks()
+        html = (
+            "<html><body>"
+            "<input type='text' id='search-box' placeholder='Search'>"
+            "<textarea id='comment-box' name='comment' placeholder='Write a comment'></textarea>"
+            "</body></html>"
+        )
+        ctx = registry.build_context(
+            Path("."),
+            extras={
+                "hook_args": {
+                    "action": "comment_inputs",
+                    "html": html,
+                }
+            },
+        )
+        result = registry.execute("parse_html_content", ctx)
+        self.assertTrue(result.success)
+        self.assertGreaterEqual(int(result.details.get("comment_candidate_count", 0)), 1)
+        candidates = result.details.get("comment_input_candidates", [])
+        self.assertTrue(any(str(item.get("tag", "")) == "textarea" for item in candidates))
+    def test_fetch_webpage_html_downloads_and_parses_comment_inputs(self) -> None:
+        registry = HookRegistry(app_name="LLMind")
+        registry.register_builtin_hooks()
+
+        html = (
+            "<html><body>"
+            "<input type='text' id='search-box' placeholder='Search'>"
+            "<textarea id='comment-box' name='comment' placeholder='Write a comment'></textarea>"
+            "</body></html>"
+        )
+
+        class _Headers(dict):
+            def get_content_charset(self):
+                return "utf-8"
+
+        class _Response:
+            def __init__(self, body: str) -> None:
+                self.status = 200
+                self.headers = _Headers({"Content-Type": "text/html; charset=utf-8"})
+                self._body = body.encode("utf-8")
+
+            def read(self, _size: int = -1):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("hooks.hook_registry.urlopen", return_value=_Response(html)):
+                ctx = registry.build_context(
+                    Path(tmpdir),
+                    extras={
+                        "hook_args": {
+                            "action": "download_parse",
+                            "url": "https://example.test/post",
+                            "parse_action": "comment_inputs",
+                            "parser_engine": "html_parser",
+                            "save_filename": "post_page.html",
+                        }
+                    },
+                )
+                result = registry.execute("fetch_webpage_html", ctx)
+                artifact_path = Path(str(result.details.get("artifact_path", "")))
+                artifact_exists_during_run = artifact_path.exists()
+
+        self.assertTrue(result.success)
+        self.assertGreaterEqual(int(result.details.get("interactive_count", 0)), 1)
+        self.assertGreaterEqual(int(result.details.get("comment_candidate_count", 0)), 1)
+        self.assertTrue(artifact_exists_during_run)
+
 
 class ProviderAdapterTests(unittest.TestCase):
     def test_openai_adapter_renders_function_tools(self) -> None:
@@ -862,6 +938,17 @@ class ProviderAdapterTests(unittest.TestCase):
         self.assertIn("tools", rendered)
         self.assertTrue(rendered["tools"])
         self.assertIn("function_declarations", rendered["tools"][0])
+
+    def test_provider_adapter_includes_parse_html_content_schema(self) -> None:
+        rendered = render_provider_tools("gemini")
+        declarations = rendered["tools"][0]["function_declarations"]
+        names = [item.get("name") for item in declarations]
+        self.assertIn("parse_html_content", names)
+    def test_provider_adapter_includes_fetch_webpage_html_schema(self) -> None:
+        rendered = render_provider_tools("gemini")
+        declarations = rendered["tools"][0]["function_declarations"]
+        names = [item.get("name") for item in declarations]
+        self.assertIn("fetch_webpage_html", names)
 
 
 class ProviderDetectionTests(unittest.TestCase):
@@ -1301,6 +1388,319 @@ class GeminiRequestTests(unittest.TestCase):
         self.assertIn("key=gm-test-key-url-inject", captured_urls[0])
 
 
+class HookOrchestrationDebugTests(unittest.TestCase):
+    def test_openai_orchestration_reports_no_followup_payload(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            writer = DataWriter()
+            cache = CacheManager(writer)
+
+            def _send_followup(_payload):
+                raise AssertionError("send_followup_request should not be called")
+
+            request_payload = {"messages": [{"role": "user", "content": "Hello"}]}
+            initial_bundle = {
+                "raw_response": {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "No tool call in this response",
+                            }
+                        }
+                    ]
+                },
+                "hook_processing": {"hook_results": []},
+            }
+
+            try:
+                result = network_requests._run_openai_chat_hook_orchestration(
+                    request_payload=request_payload,
+                    initial_bundle=initial_bundle,
+                    send_followup_request=_send_followup,
+                    provider="openai",
+                    response_params=None,
+                    response_template="openai_chat",
+                    writer=writer,
+                    cache=cache,
+                    resolved_executables=None,
+                )
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        orchestration = result.get("orchestration", {})
+        self.assertEqual(orchestration.get("stopped_reason"), "no_followup_payload")
+        self.assertEqual(orchestration.get("stop_step"), 1)
+        self.assertEqual(orchestration.get("iterations"), [])
+
+    def test_openai_orchestration_reports_no_executed_hooks(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            writer = DataWriter()
+            cache = CacheManager(writer)
+
+            def _send_followup(_payload):
+                response = {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Final answer without tool calls",
+                            }
+                        }
+                    ]
+                }
+                return 200, json.dumps(response), "OK"
+
+            request_payload = {"messages": [{"role": "user", "content": "Hello"}]}
+            initial_bundle = {
+                "raw_response": {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "filesystem_access",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                "hook_processing": {
+                    "hook_results": [
+                        {
+                            "hook_name": "filesystem_access",
+                            "success": True,
+                            "message": "ok",
+                            "details": {},
+                        }
+                    ]
+                },
+            }
+
+            try:
+                result = network_requests._run_openai_chat_hook_orchestration(
+                    request_payload=request_payload,
+                    initial_bundle=initial_bundle,
+                    send_followup_request=_send_followup,
+                    provider="openai",
+                    response_params=None,
+                    response_template="openai_chat",
+                    writer=writer,
+                    cache=cache,
+                    resolved_executables=None,
+                )
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        orchestration = result.get("orchestration", {})
+        self.assertEqual(orchestration.get("stopped_reason"), "no_executed_hooks")
+        self.assertEqual(orchestration.get("stop_step"), 1)
+        self.assertEqual(len(orchestration.get("iterations", [])), 1)
+        self.assertEqual(orchestration["iterations"][0].get("executed_hook_calls"), 0)
+
+    def test_openai_orchestration_reports_followup_http_error_step(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            writer = DataWriter()
+            cache = CacheManager(writer)
+
+            def _send_followup(_payload):
+                return 500, '{"error":"boom"}', "Internal Server Error"
+
+            request_payload = {"messages": [{"role": "user", "content": "Hello"}]}
+            initial_bundle = {
+                "raw_response": {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "filesystem_access",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                "hook_processing": {
+                    "hook_results": [
+                        {
+                            "hook_name": "filesystem_access",
+                            "success": True,
+                            "message": "ok",
+                            "details": {},
+                        }
+                    ]
+                },
+            }
+
+            try:
+                result = network_requests._run_openai_chat_hook_orchestration(
+                    request_payload=request_payload,
+                    initial_bundle=initial_bundle,
+                    send_followup_request=_send_followup,
+                    provider="openai",
+                    response_params=None,
+                    response_template="openai_chat",
+                    writer=writer,
+                    cache=cache,
+                    resolved_executables=None,
+                )
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        orchestration = result.get("orchestration", {})
+        self.assertEqual(orchestration.get("stopped_reason"), "followup_http_error")
+        self.assertEqual(orchestration.get("stop_step"), 1)
+        self.assertIn("HTTP 500", orchestration.get("error", ""))
+
+    def test_gemini_orchestration_attempts_recovery_after_zero_hooks(self) -> None:
+        original_appdata = os.environ.get("APPDATA")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["APPDATA"] = tmpdir
+            writer = DataWriter()
+            cache = CacheManager(writer)
+            followup_count = {"value": 0}
+
+            def _send_followup(_payload):
+                followup_count["value"] += 1
+                if followup_count["value"] == 1:
+                    response = {
+                        "candidates": [
+                            {
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "Done."}],
+                                },
+                                "finishReason": "STOP",
+                            }
+                        ]
+                    }
+                    return 200, json.dumps(response), "OK"
+                if followup_count["value"] == 2:
+                    response = {
+                        "candidates": [
+                            {
+                                "content": {
+                                    "role": "model",
+                                    "parts": [
+                                        {
+                                            "functionCall": {
+                                                "name": "filesystem_access",
+                                                "args": {},
+                                            }
+                                        }
+                                    ],
+                                },
+                                "finishReason": "STOP",
+                            }
+                        ]
+                    }
+                    return 200, json.dumps(response), "OK"
+
+                response = {
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [{"text": "Complete."}],
+                            },
+                            "finishReason": "STOP",
+                        }
+                    ]
+                }
+                return 200, json.dumps(response), "OK"
+
+            request_payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": "Hello"}],
+                    }
+                ]
+            }
+            initial_bundle = {
+                "raw_response": {
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "name": "filesystem_access",
+                                            "args": {},
+                                        }
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                "hook_processing": {
+                    "hook_results": [
+                        {
+                            "hook_name": "filesystem_access",
+                            "success": True,
+                            "message": "ok",
+                            "details": {},
+                        }
+                    ]
+                },
+            }
+
+            try:
+                result = network_requests._run_gemini_hook_orchestration(
+                    request_payload=request_payload,
+                    initial_bundle=initial_bundle,
+                    send_followup_request=_send_followup,
+                    provider="gemini",
+                    response_params=None,
+                    response_template="gemini_generate",
+                    writer=writer,
+                    cache=cache,
+                    resolved_executables=None,
+                )
+            finally:
+                if original_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = original_appdata
+
+        orchestration = result.get("orchestration", {})
+        self.assertTrue(orchestration.get("recovery_attempted"))
+        self.assertGreaterEqual(followup_count["value"], 2)
+        self.assertTrue(any(isinstance(item, dict) and item.get("recovery") for item in orchestration.get("iterations", [])))
+
+
 class ModelHookProcessorTests(unittest.TestCase):
     def test_capability_table_contains_expected_providers(self) -> None:
         providers = {row["provider"] for row in get_model_capability_table()}
@@ -1409,3 +1809,5 @@ class ModelHookProcessorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

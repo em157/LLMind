@@ -7,6 +7,7 @@ API key onboarding flow.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -17,7 +18,7 @@ import time
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
 
 # When running the script from the `main/` directory, sibling packages (network, cache, appdata)
@@ -38,6 +39,7 @@ from network.providers import (
 )
 from hooks.hook_registry import HookRegistry
 from response.response_handler import extract_file_artifact_candidates
+from utils.file_parser import FileParser, FileContextBuilder
 
 
 APP_NAME = "LLMind"
@@ -50,6 +52,9 @@ os.environ.setdefault("LLMIND_ENABLE_UI_HOOKS", "1")
 os.environ.setdefault("LLMIND_ENABLE_LAUNCH_HOOKS", "1")
 os.environ.setdefault("LLMIND_ENABLE_COMMAND_HOOKS", "1")
 os.environ.setdefault("LLMIND_ENABLE_WORKFLOW_HOOKS", "1")
+os.environ.setdefault("LLMIND_ENABLE_VISION_HOOKS", "0")
+os.environ.setdefault("LLMIND_VISION_MIN_CONFIDENCE", "0.72")
+os.environ.setdefault("LLMIND_VISION_MAX_RETRIES", "2")
 
 @dataclass
 class ValidationResult:
@@ -257,6 +262,7 @@ class RuntimeExecutableResolver:
 				check=False,
 				capture_output=True,
 				text=True,
+				errors="replace",
 				timeout=3,
 			)
 		except Exception:
@@ -453,7 +459,7 @@ class LLMindCLI:
 
 	@staticmethod
 	def _default_executables() -> List[str]:
-		return ["notepad.exe", "write.exe", "msedge.exe", "chrome.exe", "firefox.exe", "powershell.exe"]
+		return ["notepad.exe", "write.exe", "mspaint.exe", "msedge.exe", "chrome.exe", "firefox.exe", "powershell.exe"]
 
 	def show_banner(self) -> None:
 		print("### HELLO, WELCOME TO LLMind CLI ###\n")
@@ -477,6 +483,77 @@ class LLMindCLI:
 	def _is_llm_provider_url(url: str) -> bool:
 		"""Return True for any recognised LLM provider URL."""
 		return detect_provider(url) != "generic"
+
+	def _prompt_for_file_attachments(self) -> Tuple[List[Path], str]:
+		"""Prompt user to attach files and return (file_paths, context_string).
+		
+		Returns tuple of (list of Path objects, formatted context string for prompt).
+		"""
+		file_paths: List[Path] = []
+		context_string = ""
+
+		while True:
+			print("\nFile Attachment")
+			print("  1 - Add a file to context")
+			print("  2 - Done (proceed with request)")
+			print("  3 - Show attached files")
+			try:
+				choice = input("Select option: ").strip().lower()
+			except EOFError:
+				# End of piped input; treat as "done"
+				break
+
+			if choice == "1":
+				try:
+					file_input = input("Enter file path (or leave blank to cancel): ").strip()
+				except EOFError:
+					# End of piped input during file path prompt; treat as cancel
+					break
+				
+				if not file_input:
+					continue
+
+				file_path = Path(file_input)
+				if not FileParser.is_supported(file_path):
+					self.progress.warn(f"Unsupported file type: {file_path.suffix}")
+					continue
+
+				if not file_path.exists():
+					self.progress.warn(f"File not found: {file_path}")
+					continue
+
+				if file_path in file_paths:
+					self.progress.warn(f"File already added: {file_path.name}")
+					continue
+
+				success, content = FileParser.parse_file(file_path)
+				if success:
+					file_paths.append(file_path)
+					self.progress.ok(f"Added file: {file_path.name}")
+				else:
+					self.progress.error(f"Failed to parse: {content}")
+
+			elif choice == "2":
+				break
+			elif choice == "3":
+				if file_paths:
+					print("\nAttached files:")
+					for i, fp in enumerate(file_paths, 1):
+						print(f"  {i}. {fp.name}")
+				else:
+					print("\nNo files attached yet.")
+			else:
+				self.progress.warn("Invalid option.")
+
+		if file_paths:
+			parsed, errors = FileContextBuilder.build_context(file_paths)
+			if errors:
+				print("\nWarnings during parsing:")
+				for error in errors:
+					print(f"  ⚠️  {error}")
+			context_string = FileContextBuilder.combine_contexts(parsed)
+
+		return file_paths, context_string
 
 	def _select_api_key_for_provider(self, provider: str) -> Optional[str]:
 		"""Prompt the user to pick an API key when multiple are stored.
@@ -636,9 +713,20 @@ class LLMindCLI:
 			model = input(f"Model (default {default_model}): ").strip() or default_model
 
 		prompt_text = input("Prompt/Input text: ").strip() or "Hello from LLMind"
+		
+		# Offer file attachment
+		attach_files = input("Attach files for context? (y/n, default n): ").strip().lower()
+		file_context = ""
+		if attach_files in {"y", "yes"}:
+			_, file_context = self._prompt_for_file_attachments()
+
 		instructions = input("System instructions (optional): ").strip()
 		temperature_raw = input("Temperature (optional, e.g. 0.7): ").strip()
 		max_tokens_raw = input("Max tokens (optional): ").strip()
+
+		# Prepend file context to prompt
+		if file_context:
+			prompt_text = f"{file_context}\n\n---\n\nUser Request:\n{prompt_text}"
 
 		temperature = None
 		if temperature_raw:
@@ -682,7 +770,11 @@ class LLMindCLI:
 			print("  4 - Generate persistent hook code")
 			print("  5 - Refresh executable scan/PATH cache")
 			print("  q - Quit")
-			choice = input("Select option: ").strip().lower()
+			try:
+				choice = input("Select option: ").strip().lower()
+			except EOFError:
+				self.progress.warn("Input stream closed (EOF). Exiting.")
+				return 0
 
 			if choice == "b":
 				self.api_manager_menu()
@@ -730,6 +822,144 @@ class LLMindCLI:
 				return 0
 			else:
 				self.progress.warn("Unknown option. Try again.")
+
+	def _build_context_menu_request_prompt(
+		self,
+		file_path: Path,
+		user_prompt: str,
+		file_context: str,
+	) -> str:
+		"""Build a structured prompt for right-click context menu requests."""
+		schema_payload = {
+			"request_source": "windows_context_menu",
+			"selected_file": {
+				"path": str(file_path.resolve()),
+				"name": file_path.name,
+				"extension": file_path.suffix.lower(),
+			},
+		}
+		schema_text = json.dumps(schema_payload, indent=2)
+		sections = [
+			"Request Context Schema (JSON):",
+			schema_text,
+		]
+		if file_context:
+			sections.extend([
+				"",
+				"Attached File Context:",
+				file_context,
+			])
+		sections.extend([
+			"",
+			"User Request:",
+			user_prompt,
+		])
+		return "\n".join(sections)
+
+	def run_context_menu_request(
+		self,
+		file_path_raw: str,
+		prompt_text: str,
+		url: str,
+		method: str = "POST",
+		model: Optional[str] = None,
+		key_slot: int = 1,
+		instructions: Optional[str] = None,
+		temperature: Optional[float] = None,
+		max_tokens: Optional[int] = None,
+	) -> int:
+		"""Execute one request from a right-click selected file."""
+		self.writer.ensure_appdata()
+		self._ensure_default_settings()
+
+		file_path = Path(file_path_raw).expanduser().resolve()
+		if not file_path.exists() or not file_path.is_file():
+			self.progress.error(f"Selected file not found: {file_path}")
+			return 1
+
+		provider = detect_provider(url)
+		template_name = get_response_template_name(provider, url)
+		if template_name == "openai_chat":
+			payload_provider = "openai_chat"
+		elif template_name == "openai_images":
+			payload_provider = "openai_images"
+		else:
+			payload_provider = provider
+
+		effective_model = model or DEFAULT_MODELS.get(provider, "gpt-4.1-mini")
+		if payload_provider == "openai_images" and not model:
+			effective_model = "gpt-image-1"
+
+		file_context = ""
+		if FileParser.is_supported(file_path):
+			parsed, errors = FileContextBuilder.build_context([file_path])
+			if errors:
+				for error in errors:
+					self.progress.warn(f"File parse warning: {error}")
+			file_context = FileContextBuilder.combine_contexts(parsed)
+		else:
+			self.progress.warn(
+				f"Unsupported file type for parsing ({file_path.suffix}); continuing with path context only."
+			)
+
+		combined_prompt = self._build_context_menu_request_prompt(
+			file_path=file_path,
+			user_prompt=prompt_text,
+			file_context=file_context,
+		)
+
+		selected_key: Optional[str] = None
+		all_keys = self.cache.load_all_api_keys()
+		if provider != "generic" and all_keys:
+			# Interactive key selection for multi-key setup
+			if len(all_keys) > 1:
+				self.progress.info(f"Multiple API keys available ({len(all_keys)})")
+				selected_key = self._select_api_key_for_provider(provider)
+				if not selected_key:
+					self.progress.error("No API key selected.")
+					return 1
+			else:
+				# Single key available, use it
+				selected_key = all_keys[0]["key"]
+		else:
+			# Generic endpoint or no keys at all
+			if provider == "generic" and all_keys:
+				self.progress.warn("No API key needed for generic endpoint.")
+			elif not all_keys:
+				self.progress.error("No API key configured.")
+				return 1
+
+		payload = build_payload_from_user_input(
+			provider=payload_provider,
+			model=effective_model,
+			prompt_text=combined_prompt,
+			system_instructions=instructions or None,
+			temperature=temperature,
+			max_tokens=max_tokens,
+		)
+
+		status, body = perform_api_request(
+			url,
+			method=method.upper() or "POST",
+			json_payload=payload,
+			api_key=selected_key,
+			execute_hook_calls=True,
+			resolved_executables=self.exec_resolver.get_resolved_map(),
+		)
+
+		if status == 0 or status >= 400:
+			self.progress.error(f"Request failed ({status}): {body}")
+			return 1
+
+		self.progress.ok(f"Request returned {status}")
+		print(body)
+		downloaded_artifacts = self._store_response_artifacts(body)
+		if downloaded_artifacts:
+			downloaded_artifacts_dir = self.writer.app_data_dir / ARTIFACTS_DIRNAME
+			self.progress.ok(
+				f"Downloaded {len(downloaded_artifacts)} artifact(s) to {downloaded_artifacts_dir}"
+			)
+		return 0
 
 	def run_windows_hook_self_test(self) -> None:
 		"""Run Windows 10/11 hook checks for filesystem, registry, and UI hooks."""
@@ -1013,10 +1243,50 @@ class LLMindCLI:
 		return selected or None
 
 
-def main() -> int:
+def _parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+	parser = argparse.ArgumentParser(description="LLMind CLI")
+	parser.add_argument("--context-file", dest="context_file", help="Selected file path from shell context menu")
+	parser.add_argument("--context-prompt", dest="context_prompt", help="Prompt text for context menu request")
+	parser.add_argument("--url", dest="url", default="https://api.x.ai/v1/chat/completions", help="Target API URL")
+	parser.add_argument("--method", dest="method", default="POST", help="HTTP method (default POST)")
+	parser.add_argument("--model", dest="model", default=None, help="Model override")
+	parser.add_argument("--key-slot", dest="key_slot", type=int, default=1, help="1-based API key slot index")
+	parser.add_argument("--instructions", dest="instructions", default=None, help="Optional system instructions")
+	parser.add_argument("--temperature", dest="temperature", type=float, default=None, help="Optional temperature")
+	parser.add_argument("--max-tokens", dest="max_tokens", type=int, default=None, help="Optional max tokens")
+	return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+	args = _parse_cli_args(argv)
 	cli = LLMindCLI()
+
+	if args.context_file:
+		prompt_text = args.context_prompt or ""
+		if not prompt_text:
+			try:
+				prompt_text = input("Prompt/Input text: ").strip()
+			except EOFError:
+				prompt_text = ""
+		if not prompt_text:
+			cli.progress.error("Prompt is required for context-menu requests.")
+			return 1
+		return cli.run_context_menu_request(
+			file_path_raw=args.context_file,
+			prompt_text=prompt_text,
+			url=args.url,
+			method=args.method,
+			model=args.model,
+			key_slot=args.key_slot,
+			instructions=args.instructions,
+			temperature=args.temperature,
+			max_tokens=args.max_tokens,
+		)
+
 	return cli.run()
 
 
 if __name__ == "__main__":
 	sys.exit(main())
+
+

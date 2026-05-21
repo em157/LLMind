@@ -40,8 +40,9 @@ from utils.request_timing import RequestDelayTimer
 MAX_REMOTE_ARTIFACT_BYTES = 10 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
 OPENAI_IMAGE_TIMEOUT_SECONDS = 120
-XAI_CHAT_TIMEOUT_SECONDS = 60
-MAX_HOOK_ORCHESTRATION_STEPS = 10
+XAI_CHAT_TIMEOUT_SECONDS = 180
+GEMINI_CHAT_TIMEOUT_SECONDS = 180
+MAX_HOOK_ORCHESTRATION_STEPS = 100
 
 
 def _format_http_error(status_code: int, reason: Optional[str], body: str = "") -> str:
@@ -63,6 +64,25 @@ def _format_http_error(status_code: int, reason: Optional[str], body: str = "") 
 def _is_read_timeout_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return "read timed out" in text or "read timeout" in text
+
+
+def _is_transient_network_error(exc: Exception) -> bool:
+    """Return True for transient SSL/connection errors that are safe to retry."""
+    if _is_read_timeout_error(exc):
+        return True
+    text = str(exc).lower()
+    _transient_markers = (
+        "ssl",
+        "eof occurred",
+        "connection reset",
+        "connection aborted",
+        "remote end closed",
+        "broken pipe",
+        "connection refused",
+        "temporary failure",
+        "network is unreachable",
+    )
+    return any(m in text for m in _transient_markers)
 
 
 def _fetch_remote_artifact(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -449,10 +469,14 @@ def _run_openai_chat_hook_orchestration(
     current_payload = request_payload
     latest_bundle = initial_bundle
     iterations: List[Dict[str, Any]] = []
+    stopped_reason = "max_steps_reached"
+    stop_step = MAX_HOOK_ORCHESTRATION_STEPS
 
     for step in range(1, MAX_HOOK_ORCHESTRATION_STEPS + 1):
         followup_payload = _build_openai_chat_followup_payload(current_payload, latest_bundle)
         if followup_payload is None:
+            stopped_reason = "no_followup_payload"
+            stop_step = step
             break
 
         status_code, response_text, reason = send_followup_request(followup_payload)
@@ -461,6 +485,7 @@ def _run_openai_chat_hook_orchestration(
                 "enabled": True,
                 "iterations": iterations,
                 "stopped_reason": "followup_http_error",
+                "stop_step": step,
                 "error": _format_http_error(status_code, reason, response_text),
             }
             return latest_bundle
@@ -477,22 +502,37 @@ def _run_openai_chat_hook_orchestration(
         )
         hook_processing = next_bundle.get("hook_processing", {})
         executed_hooks = 0
+        _hook_results: list = []
         if isinstance(hook_processing, dict):
-            hook_results = hook_processing.get("hook_results", [])
-            if isinstance(hook_results, list):
-                executed_hooks = len(hook_results)
-
-        iterations.append({"step": step, "executed_hook_calls": executed_hooks})
+            _hr = hook_processing.get("hook_results", [])
+            if isinstance(_hr, list):
+                _hook_results = _hr
+                executed_hooks = len(_hook_results)
+        hook_summary = [
+            {
+                "hook": r.get("hook_name"),
+                "success": r.get("success"),
+                "message": (r.get("message") or "")[:300],
+                "details": r.get("details"),
+            }
+            for r in _hook_results
+            if isinstance(r, dict)
+        ]
+        iterations.append({"step": step, "executed_hook_calls": executed_hooks, "results": hook_summary})
         latest_bundle = next_bundle
         current_payload = followup_payload
 
         if executed_hooks == 0:
+            stopped_reason = "no_executed_hooks"
+            stop_step = step
             break
 
     latest_bundle["orchestration"] = {
         "enabled": True,
         "iterations": iterations,
         "max_steps": MAX_HOOK_ORCHESTRATION_STEPS,
+        "stopped_reason": stopped_reason,
+        "stop_step": stop_step,
     }
     return latest_bundle
 
@@ -512,10 +552,14 @@ def _run_anthropic_hook_orchestration(
     current_payload = request_payload
     latest_bundle = initial_bundle
     iterations: List[Dict[str, Any]] = []
+    stopped_reason = "max_steps_reached"
+    stop_step = MAX_HOOK_ORCHESTRATION_STEPS
 
     for step in range(1, MAX_HOOK_ORCHESTRATION_STEPS + 1):
         followup_payload = _build_anthropic_followup_payload(current_payload, latest_bundle)
         if followup_payload is None:
+            stopped_reason = "no_followup_payload"
+            stop_step = step
             break
 
         status_code, response_text, reason = send_followup_request(followup_payload)
@@ -524,6 +568,7 @@ def _run_anthropic_hook_orchestration(
                 "enabled": True,
                 "iterations": iterations,
                 "stopped_reason": "followup_http_error",
+                "stop_step": step,
                 "error": _format_http_error(status_code, reason, response_text),
             }
             return latest_bundle
@@ -540,22 +585,37 @@ def _run_anthropic_hook_orchestration(
         )
         hook_processing = next_bundle.get("hook_processing", {})
         executed_hooks = 0
+        _hook_results: list = []
         if isinstance(hook_processing, dict):
-            hook_results = hook_processing.get("hook_results", [])
-            if isinstance(hook_results, list):
-                executed_hooks = len(hook_results)
-
-        iterations.append({"step": step, "executed_hook_calls": executed_hooks})
+            _hr = hook_processing.get("hook_results", [])
+            if isinstance(_hr, list):
+                _hook_results = _hr
+                executed_hooks = len(_hook_results)
+        hook_summary = [
+            {
+                "hook": r.get("hook_name"),
+                "success": r.get("success"),
+                "message": (r.get("message") or "")[:300],
+                "details": r.get("details"),
+            }
+            for r in _hook_results
+            if isinstance(r, dict)
+        ]
+        iterations.append({"step": step, "executed_hook_calls": executed_hooks, "results": hook_summary})
         latest_bundle = next_bundle
         current_payload = followup_payload
 
         if executed_hooks == 0:
+            stopped_reason = "no_executed_hooks"
+            stop_step = step
             break
 
     latest_bundle["orchestration"] = {
         "enabled": True,
         "iterations": iterations,
         "max_steps": MAX_HOOK_ORCHESTRATION_STEPS,
+        "stopped_reason": stopped_reason,
+        "stop_step": stop_step,
     }
     return latest_bundle
 
@@ -658,6 +718,56 @@ def _build_gemini_followup_payload(
     return followup_payload
 
 
+def _build_gemini_recovery_payload(
+    request_payload: Dict[str, Any],
+    bundle: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Build a one-shot recovery prompt when Gemini returns text instead of functionCall."""
+    contents = request_payload.get("contents")
+    if not isinstance(contents, list):
+        return None
+
+    raw_response = bundle.get("raw_response")
+    if not isinstance(raw_response, dict):
+        return None
+
+    candidates = raw_response.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return None
+
+    first_candidate = candidates[0]
+    if not isinstance(first_candidate, dict):
+        return None
+
+    model_content = first_candidate.get("content")
+    if not isinstance(model_content, dict):
+        return None
+
+    model_parts = model_content.get("parts")
+    if not isinstance(model_parts, list) or not model_parts:
+        return None
+
+    followup_payload = dict(request_payload)
+    next_contents: List[Dict[str, Any]] = list(contents)
+    next_contents.append(model_content)
+    next_contents.append(
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "text": (
+                        "Continue with functionCall tool use. "
+                        "If the task is blocked, return blocked_reason with explicit evidence. "
+                        "Do not return plain completion text without either tool calls or blocked evidence."
+                    )
+                }
+            ],
+        }
+    )
+    followup_payload["contents"] = next_contents
+    return followup_payload
+
+
 def _run_gemini_hook_orchestration(
     request_payload: Dict[str, Any],
     initial_bundle: Dict[str, Any],
@@ -673,10 +783,15 @@ def _run_gemini_hook_orchestration(
     current_payload = request_payload
     latest_bundle = initial_bundle
     iterations: List[Dict[str, Any]] = []
+    stopped_reason = "max_steps_reached"
+    stop_step = MAX_HOOK_ORCHESTRATION_STEPS
+    recovery_attempted = False
 
     for step in range(1, MAX_HOOK_ORCHESTRATION_STEPS + 1):
         followup_payload = _build_gemini_followup_payload(current_payload, latest_bundle)
         if followup_payload is None:
+            stopped_reason = "no_followup_payload"
+            stop_step = step
             break
 
         status_code, response_text, reason = send_followup_request(followup_payload)
@@ -685,6 +800,7 @@ def _run_gemini_hook_orchestration(
                 "enabled": True,
                 "iterations": iterations,
                 "stopped_reason": "followup_http_error",
+                "stop_step": step,
                 "error": _format_http_error(status_code, reason, response_text),
             }
             return latest_bundle
@@ -701,22 +817,96 @@ def _run_gemini_hook_orchestration(
         )
         hook_processing = next_bundle.get("hook_processing", {})
         executed_hooks = 0
+        hook_summary: List[Dict[str, Any]] = []
         if isinstance(hook_processing, dict):
             hook_results = hook_processing.get("hook_results", [])
             if isinstance(hook_results, list):
                 executed_hooks = len(hook_results)
+                hook_summary = [
+                    {
+                        "hook": r.get("hook_name"),
+                        "success": r.get("success"),
+                        "message": (r.get("message") or "")[:300],
+                        "details": r.get("details"),
+                    }
+                    for r in hook_results
+                    if isinstance(r, dict)
+                ]
 
-        iterations.append({"step": step, "executed_hook_calls": executed_hooks})
+        iterations.append({"step": step, "executed_hook_calls": executed_hooks, "results": hook_summary})
         latest_bundle = next_bundle
         current_payload = followup_payload
 
         if executed_hooks == 0:
+            if not recovery_attempted:
+                recovery_attempted = True
+                recovery_payload = _build_gemini_recovery_payload(current_payload, latest_bundle)
+                if recovery_payload is not None:
+                    status_code, response_text, reason = send_followup_request(recovery_payload)
+                    if status_code >= 400:
+                        latest_bundle["orchestration"] = {
+                            "enabled": True,
+                            "iterations": iterations,
+                            "stopped_reason": "followup_http_error",
+                            "stop_step": step,
+                            "error": _format_http_error(status_code, reason, response_text),
+                            "recovery_attempted": recovery_attempted,
+                        }
+                        return latest_bundle
+
+                    recovery_bundle = _build_llm_response_bundle(
+                        response_text=response_text,
+                        provider=provider,
+                        response_params=response_params,
+                        response_template=response_template,
+                        writer=writer,
+                        cache=cache,
+                        execute_hook_calls=True,
+                        resolved_executables=resolved_executables,
+                    )
+                    recovery_hook_processing = recovery_bundle.get("hook_processing", {})
+                    recovery_executed_hooks = 0
+                    recovery_hook_summary: List[Dict[str, Any]] = []
+                    if isinstance(recovery_hook_processing, dict):
+                        recovery_hook_results = recovery_hook_processing.get("hook_results", [])
+                        if isinstance(recovery_hook_results, list):
+                            recovery_executed_hooks = len(recovery_hook_results)
+                            recovery_hook_summary = [
+                                {
+                                    "hook": r.get("hook_name"),
+                                    "success": r.get("success"),
+                                    "message": (r.get("message") or "")[:300],
+                                    "details": r.get("details"),
+                                }
+                                for r in recovery_hook_results
+                                if isinstance(r, dict)
+                            ]
+
+                    iterations.append(
+                        {
+                            "step": step,
+                            "recovery": True,
+                            "executed_hook_calls": recovery_executed_hooks,
+                            "results": recovery_hook_summary,
+                        }
+                    )
+                    latest_bundle = recovery_bundle
+                    current_payload = recovery_payload
+
+                    if recovery_executed_hooks > 0:
+                        continue
+
+            stopped_reason = "no_executed_hooks"
+            stop_step = step
             break
 
     latest_bundle["orchestration"] = {
         "enabled": True,
         "iterations": iterations,
         "max_steps": MAX_HOOK_ORCHESTRATION_STEPS,
+        "stopped_reason": stopped_reason,
+        "stop_step": stop_step,
+        "recovery_attempted": recovery_attempted,
     }
     return latest_bundle
 
@@ -797,6 +987,8 @@ def perform_api_request(
         timeout_seconds = OPENAI_IMAGE_TIMEOUT_SECONDS
     elif provider == "xai" and response_template in {"openai_chat", "xai_chat"}:
         timeout_seconds = XAI_CHAT_TIMEOUT_SECONDS
+    elif provider == "gemini":
+        timeout_seconds = GEMINI_CHAT_TIMEOUT_SECONDS
     else:
         timeout_seconds = DEFAULT_REQUEST_TIMEOUT_SECONDS
 
@@ -831,8 +1023,8 @@ def perform_api_request(
                         )
                     break
                 except Exception as exc:
-                    if should_retry_xai and attempt == 1 and _is_read_timeout_error(exc):
-                        progress.warn("xAI request read timeout; retrying once")
+                    if should_retry_xai and attempt <= 3 and _is_read_timeout_error(exc):
+                        progress.warn(f"xAI request read timeout; retrying (attempt {attempt})")
                         continue
                     raise
             if r.status_code >= 400:
@@ -866,18 +1058,26 @@ def perform_api_request(
                     progress.step("Submitting hook results for follow-up orchestration", duration_seconds=0)
 
                     def _send_followup(payload: Dict[str, Any]) -> Tuple[int, str, str]:
-                        followup_response = _requests.request(
-                            method,
-                            request_url,
-                            headers=headers,
-                            json=payload,
-                            timeout=timeout_seconds,
-                        )
-                        return (
-                            followup_response.status_code,
-                            followup_response.text,
-                            str(getattr(followup_response, "reason", "")),
-                        )
+                        _max_retries = 3
+                        for _attempt in range(1, _max_retries + 1):
+                            try:
+                                followup_response = _requests.request(
+                                    method,
+                                    request_url,
+                                    headers=headers,
+                                    json=payload,
+                                    timeout=timeout_seconds,
+                                )
+                                return (
+                                    followup_response.status_code,
+                                    followup_response.text,
+                                    str(getattr(followup_response, "reason", "")),
+                                )
+                            except Exception as _exc:
+                                if _attempt < _max_retries and _is_transient_network_error(_exc):
+                                    progress.warn(f"Follow-up request transient error (attempt {_attempt}); retrying")
+                                    continue
+                                raise
 
                     bundle = _run_openai_chat_hook_orchestration(
                         request_payload=json_payload,
@@ -899,18 +1099,26 @@ def perform_api_request(
                     progress.step("Submitting hook results for follow-up orchestration", duration_seconds=0)
 
                     def _send_followup(payload: Dict[str, Any]) -> Tuple[int, str, str]:
-                        followup_response = _requests.request(
-                            method,
-                            request_url,
-                            headers=headers,
-                            json=payload,
-                            timeout=timeout_seconds,
-                        )
-                        return (
-                            followup_response.status_code,
-                            followup_response.text,
-                            str(getattr(followup_response, "reason", "")),
-                        )
+                        _max_retries = 3
+                        for _attempt in range(1, _max_retries + 1):
+                            try:
+                                followup_response = _requests.request(
+                                    method,
+                                    request_url,
+                                    headers=headers,
+                                    json=payload,
+                                    timeout=timeout_seconds,
+                                )
+                                return (
+                                    followup_response.status_code,
+                                    followup_response.text,
+                                    str(getattr(followup_response, "reason", "")),
+                                )
+                            except Exception as _exc:
+                                if _attempt < _max_retries and _is_transient_network_error(_exc):
+                                    progress.warn(f"Follow-up request transient error (attempt {_attempt}); retrying")
+                                    continue
+                                raise
 
                     bundle = _run_anthropic_hook_orchestration(
                         request_payload=json_payload,
@@ -932,18 +1140,26 @@ def perform_api_request(
                     progress.step("Submitting hook results for follow-up orchestration", duration_seconds=0)
 
                     def _send_followup(payload: Dict[str, Any]) -> Tuple[int, str, str]:
-                        followup_response = _requests.request(
-                            method,
-                            request_url,
-                            headers=headers,
-                            json=payload,
-                            timeout=timeout_seconds,
-                        )
-                        return (
-                            followup_response.status_code,
-                            followup_response.text,
-                            str(getattr(followup_response, "reason", "")),
-                        )
+                        _max_retries = 3
+                        for _attempt in range(1, _max_retries + 1):
+                            try:
+                                followup_response = _requests.request(
+                                    method,
+                                    request_url,
+                                    headers=headers,
+                                    json=payload,
+                                    timeout=timeout_seconds,
+                                )
+                                return (
+                                    followup_response.status_code,
+                                    followup_response.text,
+                                    str(getattr(followup_response, "reason", "")),
+                                )
+                            except Exception as _exc:
+                                if _attempt < _max_retries and _is_transient_network_error(_exc):
+                                    progress.warn(f"Follow-up request transient error (attempt {_attempt}); retrying")
+                                    continue
+                                raise
 
                     bundle = _run_gemini_hook_orchestration(
                         request_payload=json_payload,

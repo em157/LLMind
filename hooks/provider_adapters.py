@@ -52,6 +52,37 @@ def render_anthropic_tools(schemas: List[HookSchema] | None = None) -> List[Dict
     return tools
 
 
+# Gemini's OpenAPI-subset schema rejects several JSON Schema fields that OpenAI accepts.
+# Strip them recursively before sending tool declarations.
+_GEMINI_UNSUPPORTED_SCHEMA_KEYS = {
+    "additionalProperties",
+    "$schema",
+    "$id",
+    "$ref",
+    "definitions",
+    "$defs",
+    "patternProperties",
+    "unevaluatedProperties",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "const",
+    "examples",
+}
+
+
+def _sanitize_gemini_schema(node):
+    if isinstance(node, dict):
+        cleaned: Dict[str, object] = {}
+        for key, value in node.items():
+            if key in _GEMINI_UNSUPPORTED_SCHEMA_KEYS:
+                continue
+            cleaned[key] = _sanitize_gemini_schema(value)
+        return cleaned
+    if isinstance(node, list):
+        return [_sanitize_gemini_schema(item) for item in node]
+    return node
+
+
 def render_gemini_tools(schemas: List[HookSchema] | None = None) -> List[Dict[str, object]]:
     schemas = schemas or get_hook_schemas()
     declarations: List[Dict[str, object]] = []
@@ -60,7 +91,7 @@ def render_gemini_tools(schemas: List[HookSchema] | None = None) -> List[Dict[st
             {
                 "name": schema.name,
                 "description": schema.description,
-                "parameters": schema.parameters,
+                "parameters": _sanitize_gemini_schema(schema.parameters),
             }
         )
     return declarations
@@ -88,6 +119,11 @@ def render_provider_tools(
                 {
                     "function_declarations": render_gemini_tools(schemas),
                 }
-            ]
+            ],
+            "tool_config": {
+                "function_calling_config": {
+                    "mode": "AUTO",
+                }
+            },
         }
     return {"tools": []}
