@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 *.key
 *.pem
+.venv/
+.venv-1/
 
 .env
 .env.*
@@ -19,3 +21,7 @@ artifacts/
 cache/
 tmp/
 temp/
+
+# Local secret/key cache artifacts (must never be committed)
+AQ.*
+main/AQ.*

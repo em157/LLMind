@@ -151,6 +151,14 @@ The generated module is written to `hooks/generated/persistent_hooks.py` by defa
 - Artifacts written to disk are stored under sanitized filenames with a SHA-256 fingerprint to prevent path traversal.
 - Executable resolution uses a bounded scan (`max_depth=4`, `max_hits=5`) over `Program Files`, `Program Files (x86)`, and `LOCALAPPDATA`.
 
+## PII & secret hygiene
+
+- Never commit real API keys, bearer tokens, or key-cache artifacts.
+- Keep local secrets in `.env` only; `.env` is ignored and `.env.example` is a placeholder template.
+- Avoid hardcoding personal absolute paths (for example: `C:\\Users\\<name>\\...` or `/Users/<name>/...`) in committed scripts/docs.
+- Local virtual environments (`.venv/`, `.venv-1/`) and local key-cache artifacts (`AQ.*`) are ignored to reduce accidental leakage.
+- Run `pre-commit run --all-files` before pushing. The repo includes checks for hardcoded personal absolute paths and common secret patterns.
+
 ## Additional documentation
 
 - [`COMPUTER_VISION_ADAPTATION_GUIDE.md`](COMPUTER_VISION_ADAPTATION_GUIDE.md) — adapting LLMind for vision workflows
