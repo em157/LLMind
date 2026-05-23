@@ -38,10 +38,10 @@ from utils.request_timing import RequestDelayTimer
 
 
 MAX_REMOTE_ARTIFACT_BYTES = 10 * 1024 * 1024
-DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 45
 OPENAI_IMAGE_TIMEOUT_SECONDS = 120
 XAI_CHAT_TIMEOUT_SECONDS = 60
-MAX_HOOK_ORCHESTRATION_STEPS = 10
+MAX_HOOK_ORCHESTRATION_STEPS = 50
 
 
 def _format_http_error(status_code: int, reason: Optional[str], body: str = "") -> str:

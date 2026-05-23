@@ -8,9 +8,19 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from ctypes import wintypes
+
+try:
+    import requests as _requests
+except Exception:
+    _requests = None
+
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:
+    BeautifulSoup = None
 
 
 def _resolve_executable_from_context(context: HookContext, executable: str) -> str:
@@ -27,6 +37,33 @@ def _resolve_executable_from_context(context: HookContext, executable: str) -> s
             if candidate_path.exists() and candidate_path.is_file():
                 return str(candidate_path)
     return executable
+
+
+def _resolve_user_path_alias(path_value: str) -> Path:
+    """Resolve Desktop/AppData relative aliases to absolute user paths."""
+    raw = str(path_value or "").strip()
+    if not raw:
+        return Path(raw)
+
+    normalized = raw.replace("/", "\\")
+    lower = normalized.lower()
+
+    if lower.startswith("desktop\\"):
+        return Path.home() / "Desktop" / normalized[len("desktop\\") :]
+    if lower == "desktop":
+        return Path.home() / "Desktop"
+
+    if lower.startswith("appdata\\roaming\\"):
+        return Path.home() / "AppData" / "Roaming" / normalized[len("appdata\\roaming\\") :]
+    if lower == "appdata\\roaming":
+        return Path.home() / "AppData" / "Roaming"
+
+    if lower.startswith("appdata\\local\\"):
+        return Path.home() / "AppData" / "Local" / normalized[len("appdata\\local\\") :]
+    if lower == "appdata\\local":
+        return Path.home() / "AppData" / "Local"
+
+    return Path(raw)
 
 
 @dataclass
@@ -334,6 +371,27 @@ class WindowsUIManipulationHook(BaseHook):
             details={"action": "click", "button": button, "x": x, "y": y},
         )
 
+    @staticmethod
+    def _click_window_center(hwnd: int) -> None:
+        rect = wintypes.RECT()
+        ok = ctypes.windll.user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect))
+        if not ok:
+            return
+
+        width = int(rect.right - rect.left)
+        height = int(rect.bottom - rect.top)
+        if width <= 0 or height <= 0:
+            return
+
+        x = int(rect.left + (width * 0.5))
+        y = int(rect.top + (height * 0.5))
+        if ctypes.windll.user32.SetCursorPos(x, y) == 0:
+            return
+
+        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+        time.sleep(0.04)
+
     def _execute_type_text(self, args: Dict[str, Any]) -> HookResult:
         text = str(args.get("text", ""))
         if not text:
@@ -353,31 +411,166 @@ class WindowsUIManipulationHook(BaseHook):
         if hwnd is not None:
             self._activate_window(hwnd)
 
-        foreground = ctypes.windll.user32.GetForegroundWindow()
-        if not foreground:
+        target_hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+        if not target_hwnd and hwnd is not None:
+            target_hwnd = int(hwnd)
+
+        if not target_hwnd:
             return HookResult(
                 hook_name=self.name,
                 success=False,
-                message="No foreground window available for type_text",
+                message="No target window available for type_text",
             )
 
-        wm_char = 0x0102
-        for ch in text:
-            ctypes.windll.user32.PostMessageW(wintypes.HWND(foreground), wm_char, ord(ch), 0)
+        # Rich editors such as WordPad often require a click in the document surface
+        # to place caret focus before keyboard input arrives.
+        self._click_window_center(target_hwnd)
 
-        if bool(args.get("press_enter", False)):
-            vk_return = 0x0D
-            wm_keydown = 0x0100
-            wm_keyup = 0x0101
-            ctypes.windll.user32.PostMessageW(wintypes.HWND(foreground), wm_keydown, vk_return, 0)
-            ctypes.windll.user32.PostMessageW(wintypes.HWND(foreground), wm_keyup, vk_return, 0)
+        if self._insert_text_direct(target_hwnd, text, bool(args.get("press_enter", False))):
+            return HookResult(
+                hook_name=self.name,
+                success=True,
+                message=f"Inserted {len(text)} character(s) into target document control",
+                details={"action": "type_text", "length": len(text), "target_hwnd": target_hwnd, "method": "direct_control"},
+            )
+
+        sent = self._send_text_via_sendinput(target_hwnd, text, bool(args.get("press_enter", False)))
+        if not sent:
+            self._post_text_via_messages(target_hwnd, text, bool(args.get("press_enter", False)))
 
         return HookResult(
             hook_name=self.name,
             success=True,
-            message=f"Typed {len(text)} character(s) into foreground window",
-            details={"action": "type_text", "length": len(text), "foreground_hwnd": int(foreground)},
+            message=f"Typed {len(text)} character(s) into target window",
+            details={"action": "type_text", "length": len(text), "target_hwnd": target_hwnd},
         )
+
+    def _send_text_via_sendinput(self, target_hwnd: int, text: str, press_enter: bool) -> bool:
+        # SendInput targets the active control in the foreground window, which is
+        # more reliable for modern Notepad/WordPad than posting WM_CHAR to the top-level hwnd.
+        user32 = ctypes.windll.user32
+        self._activate_window(target_hwnd)
+        time.sleep(0.06)
+
+        current_foreground = int(user32.GetForegroundWindow() or 0)
+        if current_foreground != int(target_hwnd):
+            return False
+
+        keyeventf_keyup = 0x0002
+        keyeventf_unicode = 0x0004
+        input_keyboard = 1
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", wintypes.LPARAM),
+            ]
+
+        class _INPUT_UNION(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("union", _INPUT_UNION)]
+
+        send_input = user32.SendInput
+        send_input.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+        send_input.restype = wintypes.UINT
+
+        inputs: List[INPUT] = []
+        for ch in text:
+            code = ord(ch)
+            inputs.append(
+                INPUT(
+                    type=input_keyboard,
+                    union=_INPUT_UNION(ki=KEYBDINPUT(0, code, keyeventf_unicode, 0, 0)),
+                )
+            )
+            inputs.append(
+                INPUT(
+                    type=input_keyboard,
+                    union=_INPUT_UNION(ki=KEYBDINPUT(0, code, keyeventf_unicode | keyeventf_keyup, 0, 0)),
+                )
+            )
+
+        if press_enter:
+            vk_return = 0x0D
+            inputs.append(
+                INPUT(
+                    type=input_keyboard,
+                    union=_INPUT_UNION(ki=KEYBDINPUT(vk_return, 0, 0, 0, 0)),
+                )
+            )
+            inputs.append(
+                INPUT(
+                    type=input_keyboard,
+                    union=_INPUT_UNION(ki=KEYBDINPUT(vk_return, 0, keyeventf_keyup, 0, 0)),
+                )
+            )
+
+        if not inputs:
+            return False
+
+        arr = (INPUT * len(inputs))(*inputs)
+        sent_count = int(send_input(len(arr), arr, ctypes.sizeof(INPUT)))
+        return sent_count == len(arr)
+
+    def _post_text_via_messages(self, target_hwnd: int, text: str, press_enter: bool) -> None:
+        message_hwnd = self._resolve_text_message_hwnd(target_hwnd)
+        wm_char = 0x0102
+        for ch in text:
+            ctypes.windll.user32.PostMessageW(wintypes.HWND(message_hwnd), wm_char, ord(ch), 0)
+
+        if press_enter:
+            vk_return = 0x0D
+            wm_keydown = 0x0100
+            wm_keyup = 0x0101
+            ctypes.windll.user32.PostMessageW(wintypes.HWND(message_hwnd), wm_keydown, vk_return, 0)
+            ctypes.windll.user32.PostMessageW(wintypes.HWND(message_hwnd), wm_keyup, vk_return, 0)
+
+    def _insert_text_direct(self, target_hwnd: int, text: str, press_enter: bool) -> bool:
+        message_hwnd = self._resolve_text_message_hwnd(target_hwnd)
+        class_name = self._get_window_class_name(message_hwnd).upper()
+        if class_name not in {"EDIT", "RICHEDIT20W", "RICHEDIT50W", "RICHEDITD2DPT"}:
+            return False
+
+        em_setsel = 0x00B1
+        em_replacesel = 0x00C2
+        payload = text + ("\r\n" if press_enter else "")
+        user32 = ctypes.windll.user32
+
+        # Move caret to document end and insert text directly into the editor control.
+        user32.SendMessageW(wintypes.HWND(message_hwnd), em_setsel, -1, -1)
+        inserted = user32.SendMessageW(
+            wintypes.HWND(message_hwnd),
+            em_replacesel,
+            1,
+            ctypes.c_wchar_p(payload),
+        )
+        return bool(inserted)
+
+    @staticmethod
+    def _get_window_class_name(hwnd: int) -> str:
+        if hwnd <= 0:
+            return ""
+        get_class_name = ctypes.windll.user32.GetClassNameW
+        buf = ctypes.create_unicode_buffer(256)
+        count = int(get_class_name(wintypes.HWND(hwnd), buf, 256) or 0)
+        if count <= 0:
+            return ""
+        return str(buf.value)
+
+    @staticmethod
+    def _resolve_text_message_hwnd(parent_hwnd: int) -> int:
+        user32 = ctypes.windll.user32
+        find_window_ex = user32.FindWindowExW
+        for class_name in ("RICHEDIT50W", "RICHEDIT20W", "RichEditD2DPT", "Edit"):
+            child = int(find_window_ex(wintypes.HWND(parent_hwnd), wintypes.HWND(0), class_name, None) or 0)
+            if child > 0:
+                return child
+        return parent_hwnd
 
     @staticmethod
     def _coerce_int(value: Any, field_name: str) -> int:
@@ -455,9 +648,35 @@ class WindowsUIManipulationHook(BaseHook):
     @staticmethod
     def _activate_window(hwnd: int) -> bool:
         user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
         sw_restore = 9
         user32.ShowWindow(wintypes.HWND(hwnd), sw_restore)
-        return bool(user32.SetForegroundWindow(wintypes.HWND(hwnd)))
+        user32.BringWindowToTop(wintypes.HWND(hwnd))
+        user32.SetActiveWindow(wintypes.HWND(hwnd))
+
+        if user32.SetForegroundWindow(wintypes.HWND(hwnd)):
+            return True
+
+        foreground = int(user32.GetForegroundWindow() or 0)
+        current_thread_id = int(kernel32.GetCurrentThreadId())
+        target_thread_id = int(user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), None) or 0)
+        foreground_thread_id = int(user32.GetWindowThreadProcessId(wintypes.HWND(foreground), None) or 0)
+
+        if foreground_thread_id:
+            user32.AttachThreadInput(current_thread_id, foreground_thread_id, True)
+        if target_thread_id:
+            user32.AttachThreadInput(current_thread_id, target_thread_id, True)
+
+        try:
+            user32.ShowWindow(wintypes.HWND(hwnd), sw_restore)
+            user32.BringWindowToTop(wintypes.HWND(hwnd))
+            user32.SetForegroundWindow(wintypes.HWND(hwnd))
+            return int(user32.GetForegroundWindow() or 0) == int(hwnd)
+        finally:
+            if target_thread_id:
+                user32.AttachThreadInput(current_thread_id, target_thread_id, False)
+            if foreground_thread_id:
+                user32.AttachThreadInput(current_thread_id, foreground_thread_id, False)
 
 
 class WindowsMetricsHook(BaseHook):
@@ -768,6 +987,10 @@ class CaptureScreenshotHook(BaseHook):
                 message=str(exc),
             )
 
+        expected_text_any = self._coerce_text_list(args.get("expected_text_any"), "expected_text_any")
+        expected_text_all = self._coerce_text_list(args.get("expected_text_all"), "expected_text_all")
+        ocr_notes = str(args.get("ocr_notes", "")).strip()
+
         ps_path = str(target_path).replace("'", "''")
         script = (
             "Add-Type -AssemblyName System.Windows.Forms; "
@@ -819,6 +1042,9 @@ class CaptureScreenshotHook(BaseHook):
                     "path": str(target_path),
                     "filename": filename,
                     "size": target_path.stat().st_size,
+                    "expected_text_any": expected_text_any,
+                    "expected_text_all": expected_text_all,
+                    "ocr_notes": ocr_notes,
                 },
             )
         except subprocess.TimeoutExpired:
@@ -896,6 +1122,21 @@ class CaptureScreenshotHook(BaseHook):
         if not isinstance(value, int):
             raise ValueError(f"Missing or invalid integer field: {field_name}")
         return value
+
+    @staticmethod
+    def _coerce_text_list(value: Any, field_name: str) -> List[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(f"Invalid {field_name}: expected array of strings")
+        normalized: List[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError(f"Invalid {field_name}: all entries must be strings")
+            text = item.strip()
+            if text:
+                normalized.append(text)
+        return normalized
 
     @staticmethod
     def _find_hwnd_by_title_contains(title_contains: str) -> Optional[int]:
@@ -1060,6 +1301,309 @@ class BrowserNavigationHook(BaseHook):
             )
 
 
+class WebFetchParseHook(BaseHook):
+    name = "web_fetch_parse"
+    description = "Fetch an HTTP/HTTPS page and parse links/images using BeautifulSoup"
+
+    _ALLOWED_ACTIONS = {"fetch_parse"}
+    _MAX_HTML_CHARS = 2000000
+    _MAX_RESULTS = 100
+
+    def execute(self, context: HookContext) -> HookResult:
+        args = context.extras.get("hook_args", {})
+        if not isinstance(args, dict):
+            return HookResult(hook_name=self.name, success=False, message="Invalid hook args: expected object/dict")
+
+        action = str(args.get("action", "")).strip().lower()
+        if action not in self._ALLOWED_ACTIONS:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Unsupported action '{action}'. Allowed: fetch_parse",
+            )
+
+        url = str(args.get("url", "")).strip()
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return HookResult(hook_name=self.name, success=False, message="Only http/https URLs are allowed")
+
+        max_items = args.get("max_items", 20)
+        try:
+            max_items = int(max_items)
+        except (TypeError, ValueError):
+            max_items = 20
+        max_items = max(1, min(self._MAX_RESULTS, max_items))
+
+        try:
+            html_text, final_url, status_code, content_type = self._fetch_page(url)
+        except Exception as exc:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Fetch failed: {exc.__class__.__name__}: {exc}",
+            )
+
+        title = ""
+        links: List[str] = []
+        image_urls: List[str] = []
+        listing_candidates: List[Dict[str, str]] = []
+
+        if BeautifulSoup is not None:
+            soup = BeautifulSoup(html_text, "html.parser")
+            if soup.title and soup.title.string:
+                title = soup.title.string.strip()
+
+            seen_links = set()
+            for anchor in soup.find_all("a", href=True):
+                href = str(anchor.get("href", "")).strip()
+                if not href:
+                    continue
+                absolute = urljoin(final_url, href)
+                if absolute in seen_links:
+                    continue
+                seen_links.add(absolute)
+                links.append(absolute)
+                if len(links) >= max_items:
+                    break
+
+            seen_images = set()
+            for img in soup.find_all("img", src=True):
+                src = str(img.get("src", "")).strip()
+                if not src:
+                    continue
+                absolute = urljoin(final_url, src)
+                if absolute in seen_images:
+                    continue
+                seen_images.add(absolute)
+                image_urls.append(absolute)
+                if len(image_urls) >= max_items:
+                    break
+
+            seen_candidate_urls = set()
+            for anchor in soup.find_all("a", href=True):
+                link_text = " ".join(anchor.get_text(" ", strip=True).split())
+                href = str(anchor.get("href", "")).strip()
+                if not href:
+                    continue
+                absolute = urljoin(final_url, href)
+                parsed_link = urlparse(absolute)
+                if parsed_link.scheme not in {"http", "https"}:
+                    continue
+                if absolute in seen_candidate_urls:
+                    continue
+
+                anchor_classes = " ".join(anchor.get("class", []) if isinstance(anchor.get("class", []), list) else [])
+                hay = f"{link_text} {absolute} {anchor_classes}".lower()
+                is_listing_like = (
+                    "/d/" in parsed_link.path
+                    or parsed_link.path.endswith(".html")
+                    or "result-title" in hay
+                    or "listing" in hay
+                )
+                if not is_listing_like:
+                    continue
+
+                hay = f"{link_text} {absolute}".lower()
+                if "bicycle" not in hay and "bike" not in hay and "bia" not in parsed_link.path.lower():
+                    continue
+                seen_candidate_urls.add(absolute)
+                listing_candidates.append(
+                    {
+                        "title": link_text[:200] if link_text else absolute,
+                        "url": absolute,
+                    }
+                )
+                if len(listing_candidates) >= max_items:
+                    break
+
+            if not listing_candidates:
+                for absolute in links:
+                    parsed_link = urlparse(absolute)
+                    if parsed_link.scheme not in {"http", "https"}:
+                        continue
+                    if "/d/" not in parsed_link.path and not parsed_link.path.endswith(".html"):
+                        continue
+                    if absolute in seen_candidate_urls:
+                        continue
+                    seen_candidate_urls.add(absolute)
+                    listing_candidates.append({"title": absolute, "url": absolute})
+                    if len(listing_candidates) >= max_items:
+                        break
+        else:
+            title_match = re.search(r"<title>(.*?)</title>", html_text, flags=re.IGNORECASE | re.DOTALL)
+            if title_match:
+                title = " ".join(title_match.group(1).split())
+
+        snippet = re.sub(r"\s+", " ", html_text)[:500]
+        return HookResult(
+            hook_name=self.name,
+            success=True,
+            message="Fetched and parsed HTML page",
+            details={
+                "action": action,
+                "url": url,
+                "final_url": final_url,
+                "status_code": status_code,
+                "content_type": content_type,
+                "title": title,
+                "html_char_count": len(html_text),
+                "snippet": snippet,
+                "links": links,
+                "image_urls": image_urls,
+                "listing_candidates": listing_candidates,
+                "parser": "bs4" if BeautifulSoup is not None else "regex_fallback",
+            },
+        )
+
+    def _fetch_page(self, url: str) -> tuple[str, str, int, str]:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LLMind/1.0"}
+        if _requests is not None:
+            response = _requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            content_type = str(response.headers.get("content-type", "")).lower()
+            if "html" not in content_type and "xml" not in content_type:
+                raise ValueError(f"Unsupported content-type for HTML parsing: {content_type or 'unknown'}")
+            text = response.text[: self._MAX_HTML_CHARS]
+            return text, str(response.url), int(response.status_code), content_type
+
+        from urllib import request as _request
+
+        req = _request.Request(url, headers=headers)
+        with _request.urlopen(req, timeout=15) as resp:
+            raw = resp.read(self._MAX_HTML_CHARS + 1)
+            text = raw[: self._MAX_HTML_CHARS].decode("utf-8", errors="replace")
+            final_url = str(getattr(resp, "url", url))
+            status = int(getattr(resp, "status", 200))
+            content_type = str(resp.headers.get("content-type", "")).lower()
+            if "html" not in content_type and "xml" not in content_type:
+                raise ValueError(f"Unsupported content-type for HTML parsing: {content_type or 'unknown'}")
+            return text, final_url, status, content_type
+
+
+class DownloadRemoteFileHook(BaseHook):
+    name = "download_remote_file"
+    description = "Download a remote HTTP/HTTPS file into Desktop/AppData safe directories"
+
+    _ALLOWED_ACTIONS = {"download"}
+    _SAFE_BASE_DIRS = [
+        Path.home() / "Desktop",
+        Path.home() / "Desktop" / "test_dir",
+        Path.home() / "AppData" / "Roaming" / "LLMind",
+        Path.home() / "AppData" / "Local" / "Temp",
+    ]
+    _MAX_BYTES = 10 * 1024 * 1024
+
+    def _is_safe_path(self, filepath: str) -> bool:
+        try:
+            file_path = _resolve_user_path_alias(filepath).resolve()
+            for safe_dir in self._SAFE_BASE_DIRS:
+                safe_resolved = safe_dir.resolve()
+                try:
+                    file_path.relative_to(safe_resolved)
+                    return True
+                except ValueError:
+                    continue
+            return False
+        except Exception:
+            return False
+
+    def execute(self, context: HookContext) -> HookResult:
+        args = context.extras.get("hook_args", {})
+        if not isinstance(args, dict):
+            return HookResult(hook_name=self.name, success=False, message="Invalid hook args: expected object/dict")
+
+        action = str(args.get("action", "")).strip().lower()
+        if action not in self._ALLOWED_ACTIONS:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Unsupported action '{action}'. Allowed: download",
+            )
+
+        url = str(args.get("url", "")).strip()
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return HookResult(hook_name=self.name, success=False, message="Only http/https URLs are allowed")
+
+        filepath = str(args.get("filepath", "")).strip()
+        if not filepath:
+            return HookResult(hook_name=self.name, success=False, message="filepath is required")
+        if not self._is_safe_path(filepath):
+            safe_dirs = ", ".join(str(d) for d in self._SAFE_BASE_DIRS)
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Access denied. File must be in: {safe_dirs}",
+            )
+
+        overwrite = bool(args.get("overwrite", True))
+        max_bytes = args.get("max_bytes", self._MAX_BYTES)
+        try:
+            max_bytes = int(max_bytes)
+        except (TypeError, ValueError):
+            max_bytes = self._MAX_BYTES
+        max_bytes = max(1, min(self._MAX_BYTES, max_bytes))
+
+        output_path = _resolve_user_path_alias(filepath)
+        if output_path.exists() and not overwrite:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"File already exists and overwrite=false: {output_path}",
+            )
+
+        try:
+            content, status_code, content_type = self._download_bytes(url, max_bytes)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, "wb") as handle:
+                handle.write(content)
+            return HookResult(
+                hook_name=self.name,
+                success=True,
+                message=f"Downloaded {len(content)} bytes",
+                details={
+                    "action": action,
+                    "url": url,
+                    "filepath": str(output_path),
+                    "bytes": len(content),
+                    "status_code": status_code,
+                    "content_type": content_type,
+                    "overwrite": overwrite,
+                },
+            )
+        except Exception as exc:
+            return HookResult(
+                hook_name=self.name,
+                success=False,
+                message=f"Download failed: {exc.__class__.__name__}: {exc}",
+            )
+
+    def _download_bytes(self, url: str, max_bytes: int) -> tuple[bytes, int, str]:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LLMind/1.0"}
+        if _requests is not None:
+            response = _requests.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
+            content = bytes(response.content)
+            if not content:
+                raise ValueError("Empty response body")
+            if len(content) > max_bytes:
+                raise ValueError(f"Remote file exceeds max_bytes={max_bytes}")
+            return content, int(response.status_code), str(response.headers.get("content-type", ""))
+
+        from urllib import request as _request
+
+        req = _request.Request(url, headers=headers)
+        with _request.urlopen(req, timeout=20) as resp:
+            content = resp.read(max_bytes + 1)
+            if not content:
+                raise ValueError("Empty response body")
+            if len(content) > max_bytes:
+                raise ValueError(f"Remote file exceeds max_bytes={max_bytes}")
+            status = int(getattr(resp, "status", 200))
+            content_type = str(resp.headers.get("content-type", ""))
+            return content, status, content_type
+
+
 class SystemCommandHook(BaseHook):
     name = "system_command"
     description = "Run guarded allowlisted system commands for diagnostics"
@@ -1196,6 +1740,8 @@ class OrchestrateWorkflowHook(BaseHook):
         "windows_metrics",
         "launch_process",
         "browser_navigation",
+        "web_fetch_parse",
+        "download_remote_file",
         "windows_ui_action",
         "capture_screenshot",
         "system_command",
@@ -1332,7 +1878,7 @@ class ReadFileHook(BaseHook):
     def _is_safe_path(self, filepath: str) -> bool:
         """Validate that the filepath is within an allowed base directory."""
         try:
-            file_path = Path(filepath).resolve()
+            file_path = _resolve_user_path_alias(filepath).resolve()
             for safe_dir in self._SAFE_BASE_DIRS:
                 safe_resolved = safe_dir.resolve()
                 try:
@@ -1377,7 +1923,7 @@ class ReadFileHook(BaseHook):
                 message=f"Access denied. File must be in: {safe_dirs}",
             )
 
-        file_path = Path(filepath)
+        file_path = _resolve_user_path_alias(filepath)
         if not file_path.exists():
             return HookResult(
                 hook_name=self.name,
@@ -1438,7 +1984,7 @@ class ListDirectoryHook(BaseHook):
     def _is_safe_path(self, dirpath: str) -> bool:
         """Validate that the dirpath is within an allowed base directory."""
         try:
-            dir_path = Path(dirpath).resolve()
+            dir_path = _resolve_user_path_alias(dirpath).resolve()
             for safe_dir in self._SAFE_BASE_DIRS:
                 safe_resolved = safe_dir.resolve()
                 try:
@@ -1483,7 +2029,7 @@ class ListDirectoryHook(BaseHook):
                 message=f"Access denied. Directory must be in: {safe_dirs}",
             )
 
-        dir_path = Path(dirpath)
+        dir_path = _resolve_user_path_alias(dirpath)
         if not dir_path.exists():
             return HookResult(
                 hook_name=self.name,
@@ -1550,7 +2096,7 @@ class WriteFileHook(BaseHook):
     def _is_safe_path(self, filepath: str) -> bool:
         """Validate that the filepath is within an allowed base directory."""
         try:
-            file_path = Path(filepath).resolve()
+            file_path = _resolve_user_path_alias(filepath).resolve()
             for safe_dir in self._SAFE_BASE_DIRS:
                 safe_resolved = safe_dir.resolve()
                 try:
@@ -1598,7 +2144,7 @@ class WriteFileHook(BaseHook):
         content = str(args.get("content", ""))
         overwrite = bool(args.get("overwrite", True))
 
-        file_path = Path(filepath)
+        file_path = _resolve_user_path_alias(filepath)
         if file_path.exists() and not overwrite:
             return HookResult(
                 hook_name=self.name,
@@ -1907,6 +2453,8 @@ class HookRegistry:
         self.register(LaunchProcessHook())
         self.register(CaptureScreenshotHook())
         self.register(BrowserNavigationHook())
+        self.register(WebFetchParseHook())
+        self.register(DownloadRemoteFileHook())
         self.register(SystemCommandHook())
         self.register(OrchestrateWorkflowHook())
         self.register(ReadFileHook())
@@ -1958,6 +2506,8 @@ class HookRegistry:
             "launch_process": "LaunchProcessHook",
             "capture_screenshot": "CaptureScreenshotHook",
             "browser_navigation": "BrowserNavigationHook",
+            "web_fetch_parse": "WebFetchParseHook",
+            "download_remote_file": "DownloadRemoteFileHook",
             "system_command": "SystemCommandHook",
             "orchestrate_workflow": "OrchestrateWorkflowHook",
         }

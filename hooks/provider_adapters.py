@@ -5,6 +5,20 @@ from typing import Dict, List
 from hooks.hook_schemas import HookSchema, get_hook_schemas
 
 
+def _strip_gemini_unsupported_schema_fields(value: object) -> object:
+    """Recursively drop JSON schema fields Gemini tool declarations reject."""
+    if isinstance(value, dict):
+        cleaned: Dict[str, object] = {}
+        for key, nested in value.items():
+            if key == "additionalProperties":
+                continue
+            cleaned[key] = _strip_gemini_unsupported_schema_fields(nested)
+        return cleaned
+    if isinstance(value, list):
+        return [_strip_gemini_unsupported_schema_fields(item) for item in value]
+    return value
+
+
 def render_openai_tools(schemas: List[HookSchema] | None = None) -> List[Dict[str, object]]:
     """Chat Completions API tool format: name nested inside 'function'."""
     schemas = schemas or get_hook_schemas()
@@ -60,7 +74,7 @@ def render_gemini_tools(schemas: List[HookSchema] | None = None) -> List[Dict[st
             {
                 "name": schema.name,
                 "description": schema.description,
-                "parameters": schema.parameters,
+                "parameters": _strip_gemini_unsupported_schema_fields(schema.parameters),
             }
         )
     return declarations
