@@ -109,6 +109,42 @@ main\ARGS.cmd
 
 The bundled example targets xAI's `grok-4.3` and asks it to *"Open 4 windows notepads and arrange them visibly on the screen."*
 
+### Prompt workflow (run, share, commit)
+
+Use the helper command to run prompt files against any supported provider, export a shareable zip bundle, and commit prompt updates safely from a feature branch.
+
+```cmd
+main\PROMPT_WORKFLOW.cmd -Action run -Provider xai -PromptFile prompts\PROMPT_1_WINDOWS_UI_TRIAGE.md -KeyIndex 2
+main\PROMPT_WORKFLOW.cmd -Action share
+main\PROMPT_WORKFLOW.cmd -Action commit -CommitMessage "Update provider prompt pack"
+```
+
+Details and additional flags are documented in `prompts/WORKFLOW.md`.
+
+### Prompt pack additions
+
+The `prompts/` folder now includes a practical progression from focused diagnostics to full multi-step automation:
+
+- `PROMPT_1_WINDOWS_UI_TRIAGE.md` - baseline Windows UI troubleshooting flow
+- `PROMPT_2_BROWSER_VERIFY.md` - browser verification and evidence capture
+- `PROMPT_3_DIAGNOSTICS_AND_EMAIL.md` - diagnostics + optional notification flow
+- `PROMPT_4_UI_OCR_NETWORK_PLAYBOOK.md` - combined UI actions, screenshots, OCR-style validation, and network checks
+- `PROMPT_5_BICYCLE_CALI_IMAGE_COLLECTION.md` - web parsing + remote file download pipeline with manifest/report outputs
+- `PROMPT_6_UI_OCR_INTERACTIVE_CHECKIN.md` - interactive WordPad/Notepad check-in scenario with OCR-style token checks
+- `PROMPT_7_EFFICIENT_FULL_TOOLCHAIN_PLAYBOOK.md` - compact "use every reasonable tool" workflow with strict success criteria
+
+### Prompt flow execution model
+
+`main/PROMPT_WORKFLOW.cmd` and `scripts/prompt_workflow.ps1` provide a repeatable execution path for prompt files:
+
+1. Resolve provider, key index, model, and prompt file inputs.
+2. Feed the prompt into `main/LLMind.py` using scripted menu automation.
+3. Execute model tool calls through hook schemas in `hooks/hook_schemas.py` and runtime logic in `hooks/hook_registry.py`.
+4. Persist artifacts and outputs under `%APPDATA%\\LLMind` (screenshots, reports, manifests, and related files).
+5. Optionally package prompt updates with `-Action share` and create a scoped commit with `-Action commit`.
+
+This flow keeps prompt runs reproducible while still allowing provider/model swaps per run.
+
 ## Configuration
 
 All settings can be provided via `.env` or real environment variables.
